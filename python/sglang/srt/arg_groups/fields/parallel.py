@@ -56,6 +56,10 @@ class Parallel:
             aliases=["--tensor-parallel-size"],
         ),
     ] = 1
+    ulysses_sp_size: A[
+        int,
+        "Fixed Qwen3 Ulysses sequence parallelism size. Divides --tp-size (the total worker count); the entire model uses TP subgroups of tp_size / ulysses_sp_size ranks, with token shards across SP. Requires FlashAttention (fa3/fa4) and eager execution. Cannot be combined with attention context parallelism, decode context parallelism, or DP attention.",
+    ] = 1
     dcp_size: A[
         int,
         Arg(
@@ -126,7 +130,7 @@ class Parallel:
             help="Communication backend for the decode context-parallel (DCP) "
             "attention reduction: 'ag_rs' (AllGather + ReduceScatter), 'a2a' "
             "(fused NCCL All-to-All exchange of output+LSE + local Triton LSE "
-            "combine), or 'fi_a2a' (FlashInfer MNNVL All-to-All kernel; requires "
+            "combine), or 'fi_a2a' (FlashAttention MNNVL All-to-All kernel; requires "
             "SM90+ and MNNVL fabric memory, e.g. GB200 NVL72).",
             choices=["ag_rs", "a2a", "fi_a2a"],
             resolvable=True,

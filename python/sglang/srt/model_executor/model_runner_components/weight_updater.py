@@ -41,6 +41,14 @@ def _unsupported_derived_weight_cache_error() -> Optional[str]:
     old weights. The check is startup-determined and rank-uniform, so an
     update never proceeds on some workers while rejected on others.
     """
+    from sglang.srt.runtime_context import get_parallel
+
+    if get_parallel().ulysses_sp_size > 1:
+        return (
+            "Online weight updates are not supported with fixed Ulysses SP: "
+            "update paths do not yet use the model's TP subgroup."
+        )
+
     from sglang.kernels.ops.attention.dsv4.gemm import hpc_bf16xfp32_gemm_enabled
 
     if hpc_bf16xfp32_gemm_enabled():

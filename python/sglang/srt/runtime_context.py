@@ -351,6 +351,11 @@ class ParallelContext:
         return self._v("world_size", _ps().get_world_size)
 
     @property
+    def ulysses_topology(self):
+        """Stable full scheduling group and explicit Ulysses compute groups."""
+        return _ps().get_ulysses_topology()
+
+    @property
     def world_rank(self) -> int:
         return self._v("world_rank", _ps().get_world_rank)
 

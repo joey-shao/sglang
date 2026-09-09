@@ -434,6 +434,15 @@ class LogitsProcessor(nn.Module):
         aux_hidden_states: Optional[AuxHiddenStates] = None,
         hidden_states_before_norm: Optional[torch.Tensor] = None,
     ) -> LogitsProcessorOutput:
+        if getattr(logits_metadata, "sp_metadata", None) is not None:
+            from sglang.srt.layers.sp_strategy import get_sp_strategy
+
+            if aux_hidden_states is not None or hidden_states_before_norm is not None:
+                raise ValueError("SP logits do not support auxiliary hidden states")
+            input_ids, hidden_states, logits_metadata = (
+                get_sp_strategy().gather_logits_inputs(hidden_states, logits_metadata)
+            )
+
         # Extract MIS indices before ForwardBatch → LogitsMetadata conversion
         multi_item_delimiter_indices = None
         if isinstance(logits_metadata, ForwardBatch):

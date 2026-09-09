@@ -67,6 +67,7 @@ from sglang.srt.utils import (
 from sglang.srt.utils.common import ceil_align, is_pin_memory_available
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.sp_strategy import SPBatchMetadata
     from sglang.srt.layers.cp.base import BaseContextParallelMetadata
     from sglang.srt.layers.dcp.metadata import DecodeContextParallelMetadata
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -601,6 +602,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     tbo_padded_len: Optional[int] = None
     tbo_children: Optional[List[ForwardBatch]] = None
 
+    # Local execution tensors plus a preserved global attention/logits view.
+    sp_metadata: Optional[SPBatchMetadata] = None
+
     attn_cp_metadata: Optional[BaseContextParallelMetadata] = None
 
     # For decode context parallel.
@@ -897,7 +901,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             ret.positions = torch.empty((0,), dtype=torch.int64, device=device)
             if model_runner.lora_manager is not None:
                 model_runner.lora_manager.reset_lora_batch()
-            return ret
+            return ret.prepare_sp_batch()
 
         # Override the positions with diffusion LLM or spec_info
         if batch.dllm_config is not None:
@@ -989,7 +993,13 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 == model_runner.ps.attn_dcp_rank
             )
 
-        return ret
+        return ret.prepare_sp_batch()
+
+    def prepare_sp_batch(self):
+        from sglang.srt.layers.sp_strategy import get_sp_strategy
+
+        strategy = get_sp_strategy()
+        return strategy.prepare_batch(self) if strategy is not None else self
 
     def _maybe_init_non_generation_fields(self, batch: ScheduleBatch):
         """Derive non-generation (max_new_tokens==0) forward fields from reqs.

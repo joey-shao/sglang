@@ -44,6 +44,11 @@ from torch.distributed import Backend, ProcessGroup
 
 from sglang.srt import platforms
 from sglang.srt.compilation.compilation_config import register_split_op
+from sglang.srt.distributed.ulysses_parallel import (
+    UlyssesRankLayout,
+    UlyssesTopology,
+    create_ulysses_topology,
+)
 from sglang.srt.distributed.utils import set_global_tcp_store
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
@@ -1936,6 +1941,16 @@ def init_model_parallel_group(
 
 
 _TP: Optional[GroupCoordinator] = None
+_ULYSSES_TOPOLOGY: Optional[UlyssesTopology] = None
+
+
+def get_ulysses_topology() -> UlyssesTopology:
+    """Return Ulysses compute groups without changing the scheduler's TP group."""
+    if _ULYSSES_TOPOLOGY is None:
+        raise RuntimeError("Ulysses Parallel topology is not initialized")
+    return _ULYSSES_TOPOLOGY
+
+
 _ATTN_TP: Optional[GroupCoordinator] = None
 _ATTN_CP: Optional[GroupCoordinator] = None
 _DCP: Optional[GroupCoordinator] = None
@@ -2309,6 +2324,7 @@ def initialize_model_parallel(
     recovered_rank: bool = False,
     rank_offset: int = 0,
     max_world_size: Optional[int] = None,
+    ulysses_sequence_parallel_size: int = 1,
 ) -> None:
     """
     Initialize model parallel groups.
@@ -2363,6 +2379,25 @@ def initialize_model_parallel(
     with a total of 16 GPUs, rank 0 to 7 belong to the first box and
     ranks 8 to 15 belong to the second box.
     """
+    # Validate before creating any groups, including direct callers without CLI.
+    ulysses_layout = UlyssesRankLayout(
+        tensor_model_parallel_size, ulysses_sequence_parallel_size
+    )
+    if ulysses_sequence_parallel_size > 1 and (
+        pipeline_model_parallel_size != 1
+        or expert_model_parallel_size != 1
+        or attention_data_parallel_size != 1
+        or attention_context_model_parallel_size != 1
+        or moe_data_model_parallel_size != 1
+        or decode_context_parallel_size != 1
+        or duplicate_tp_group
+        or recovered_rank
+        or rank_offset
+    ):
+        raise ValueError(
+            "Ulysses topology requires a single, static TP scheduling domain"
+        )
+
     # Get world size and rank. Ensure some consistencies.
     assert torch.distributed.is_initialized()
     backend = backend or torch.distributed.get_backend(get_world_group().device_group)
@@ -2422,6 +2457,17 @@ def initialize_model_parallel(
         rank_offset=rank_offset,
         max_world_size=max_world_size,
     )
+
+    global _ULYSSES_TOPOLOGY
+    assert _ULYSSES_TOPOLOGY is None, "Ulysses topology is already initialized"
+    if ulysses_sequence_parallel_size > 1:
+        _ULYSSES_TOPOLOGY = create_ulysses_topology(
+            ulysses_layout,
+            _TP,
+            init_model_parallel_group,
+            local_rank=get_world_group().local_rank,
+            backend=backend,
+        )
 
     if duplicate_tp_group:
         global _PDMUX_PREFILL_TP_GROUP
@@ -2736,6 +2782,7 @@ def ensure_model_parallel_initialized(
     pipeline_model_parallel_size: int,
     decode_context_parallel_size: int = 1,
     backend: Optional[str] = None,
+    ulysses_sequence_parallel_size: int = 1,
 ) -> None:
     """Helper to initialize model parallel groups if they are not initialized,
     or ensure tensor-parallel and pipeline-parallel sizes are equal to expected
@@ -2749,6 +2796,7 @@ def ensure_model_parallel_initialized(
             pipeline_model_parallel_size=pipeline_model_parallel_size,
             decode_context_parallel_size=decode_context_parallel_size,
             backend=backend,
+            ulysses_sequence_parallel_size=ulysses_sequence_parallel_size,
         )
         return
 
@@ -2757,6 +2805,11 @@ def ensure_model_parallel_initialized(
         f"{get_tensor_model_parallel_world_size()=} vs. "
         f"{tensor_model_parallel_size=}"
     )
+    actual_ulysses_size = _ULYSSES_TOPOLOGY.layout.sp_size if _ULYSSES_TOPOLOGY else 1
+    if actual_ulysses_size != ulysses_sequence_parallel_size:
+        raise ValueError(
+            "Ulysses topology is already initialized with a different SP size"
+        )
     pp_world_size = get_pp_group().world_size
     assert pp_world_size == pipeline_model_parallel_size, (
         "pipeline parallel group already initialized, but of unexpected size: "
@@ -2933,6 +2986,13 @@ def destroy_model_parallel():
     if dwdp_mgr is not None:
         dwdp_mgr.cleanup()
         set_global_dwdp_manager(None)
+
+    global _ULYSSES_TOPOLOGY
+    if _ULYSSES_TOPOLOGY is not None:
+        _ULYSSES_TOPOLOGY.sp_group.destroy()
+        _ULYSSES_TOPOLOGY.base_tp_group.destroy()
+        # full_tp_group is borrowed; its lifecycle remains owned by _TP.
+        _ULYSSES_TOPOLOGY = None
 
     global _TP
     if _TP:

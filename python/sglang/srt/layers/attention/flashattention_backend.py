@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import partial
 from typing import TYPE_CHECKING, Optional
 
 import numpy as np
@@ -703,6 +704,9 @@ class FlashAttentionBackend(AttentionBackend):
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize forward metadata hence all layers in the forward pass can reuse it."""
+        from sglang.srt.layers.sp_strategy import get_global_sp_batch
+
+        forward_batch = get_global_sp_batch(forward_batch)
         metadata = FlashAttentionMetadata()
         seqlens_in_batch = forward_batch.seq_lens
         batch_size = forward_batch.batch_size
@@ -1241,6 +1245,86 @@ class FlashAttentionBackend(AttentionBackend):
         rel_bias=None,
         rel_bias_event=None,
     ):
+        from sglang.srt.layers.sp_strategy import SPKVWrite, get_sp_strategy
+
+        if (
+            getattr(forward_batch, "sp_metadata", None) is not None
+            and not forward_batch.forward_mode.is_idle()
+        ):
+            strategy = get_sp_strategy()
+            if any(
+                value is not None
+                for value in (
+                    q_rope,
+                    k_rope,
+                    sinks,
+                    q_descale,
+                    k_descale,
+                    v_descale,
+                    score_mod,
+                    aux_tensors,
+                    rel_bias,
+                    rel_bias_event,
+                )
+            ):
+                raise ValueError(
+                    "SP QKV redistribution requires dense attention inputs"
+                )
+            # Fixed Qwen3 SP supports dense causal attention with BF16 KV.
+            # Keep kernel selection here; the strategy owns QKV exchange and KV writes.
+            if (
+                self.use_mla
+                or self.fa_skip_kv_cache
+                or self.has_local_attention
+                or layer.is_cross_attention
+                or layer.attn_type != AttentionType.DECODER
+                or (
+                    layer.sliding_window_size is not None
+                    and layer.sliding_window_size > -1
+                )
+            ):
+                raise ValueError(
+                    "Ulysses requires dense causal attention with KV cache"
+                )
+            metadata = self.forward_metadata
+            key_cache, value_cache = self.get_paged_mha_kv_cache(
+                layer, head_group_num=strategy.sp_size
+            )
+            kernel_kwargs = {}
+            kernel_kwargs["cu_seqlens_k_new"] = metadata.cu_seqlens_k
+            attention_kernel = partial(
+                flash_attn_with_kvcache,
+                k_cache=key_cache,
+                v_cache=value_cache,
+                page_table=metadata.page_table,
+                cache_seqlens=metadata.cache_seqlens_int32,
+                cu_seqlens_q=metadata.cu_seqlens_q,
+                max_seqlen_q=metadata.max_seq_len_q,
+                softmax_scale=layer.scaling,
+                causal=True,
+                window_size=(-1, -1),
+                softcap=layer.logit_cap,
+                num_splits=self.num_splits,
+                ver=self.fa_impl_ver,
+                **kernel_kwargs,
+            )
+            kv_write = SPKVWrite(
+                pool=self.token_to_kv_pool,
+                location=KVWriteLoc(
+                    forward_batch.sp_metadata.global_batch.out_cache_loc,
+                    metadata.swa_out_cache_loc,
+                ),
+                enabled=save_kv_cache,
+            )
+            return strategy.forward_attention(
+                q,
+                k,
+                v,
+                layer,
+                forward_batch,
+                attention_kernel=attention_kernel,
+                kv_write=kv_write,
+            )
         if score_mod is not None and self.fa_impl_ver != 4:
             raise RuntimeError("score_mod is only supported by the FA4 backend.")
         cp_active = is_cp_v2_active(forward_batch)
@@ -1802,6 +1886,88 @@ class FlashAttentionBackend(AttentionBackend):
         rel_bias=None,
         rel_bias_event=None,
     ) -> torch.Tensor:
+        from sglang.srt.layers.sp_strategy import SPKVWrite, get_sp_strategy
+
+        if (
+            getattr(forward_batch, "sp_metadata", None) is not None
+            and not forward_batch.forward_mode.is_idle()
+        ):
+            strategy = get_sp_strategy()
+            if any(
+                value is not None
+                for value in (
+                    q_rope,
+                    k_rope,
+                    sinks,
+                    q_descale,
+                    k_descale,
+                    v_descale,
+                    score_mod,
+                    aux_tensors,
+                    rel_bias,
+                    rel_bias_event,
+                )
+            ):
+                raise ValueError(
+                    "SP QKV redistribution requires dense attention inputs"
+                )
+            # Fixed Qwen3 SP supports dense causal attention with BF16 KV.
+            # Keep kernel selection here; the strategy owns QKV exchange and KV writes.
+            if (
+                self.use_mla
+                or self.fa_skip_kv_cache
+                or self.has_local_attention
+                or layer.is_cross_attention
+                or layer.attn_type != AttentionType.DECODER
+                or (
+                    layer.sliding_window_size is not None
+                    and layer.sliding_window_size > -1
+                )
+            ):
+                raise ValueError(
+                    "Ulysses requires dense causal attention with KV cache"
+                )
+            metadata = self.forward_metadata
+            key_cache, value_cache = self.get_paged_mha_kv_cache(
+                layer, head_group_num=strategy.sp_size
+            )
+            kernel_kwargs = {}
+            kernel_kwargs["scheduler_metadata"] = metadata.scheduler_metadata
+            if self._decode_uses_static_max_seqlen_k:
+                kernel_kwargs["max_seqlen_k"] = metadata.max_seq_len_k
+            attention_kernel = partial(
+                flash_attn_with_kvcache,
+                k_cache=key_cache,
+                v_cache=value_cache,
+                page_table=metadata.page_table,
+                cache_seqlens=metadata.cache_seqlens_int32,
+                cu_seqlens_q=metadata.cu_seqlens_q,
+                max_seqlen_q=metadata.max_seq_len_q,
+                softmax_scale=layer.scaling,
+                causal=True,
+                window_size=(-1, -1),
+                softcap=layer.logit_cap,
+                num_splits=self.decode_num_splits,
+                ver=self.fa_impl_ver,
+                **kernel_kwargs,
+            )
+            kv_write = SPKVWrite(
+                pool=self.token_to_kv_pool,
+                location=KVWriteLoc(
+                    forward_batch.sp_metadata.global_batch.out_cache_loc,
+                    metadata.swa_out_cache_loc,
+                ),
+                enabled=save_kv_cache,
+            )
+            return strategy.forward_attention(
+                q,
+                k,
+                v,
+                layer,
+                forward_batch,
+                attention_kernel=attention_kernel,
+                kv_write=kv_write,
+            )
         if score_mod is not None and self.fa_impl_ver != 4:
             raise RuntimeError("score_mod is only supported by the FA4 backend.")
         if k is not None:
