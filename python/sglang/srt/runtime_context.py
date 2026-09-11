@@ -351,6 +351,22 @@ class ParallelContext:
         return self._v("world_size", _ps().get_world_size)
 
     @property
+    def ulysses_full_tp_group(self):
+        return _ps().get_ulysses_full_tp_group()
+
+    @property
+    def ulysses_model_tp_group(self):
+        return _ps().get_ulysses_model_tp_group()
+
+    @property
+    def ulysses_sp_group(self):
+        return _ps().get_ulysses_sp_group()
+
+    @property
+    def ulysses_attention_shard_rank(self):
+        return _ps().get_ulysses_attention_shard_rank()
+
+    @property
     def world_rank(self) -> int:
         return self._v("world_rank", _ps().get_world_rank)
 

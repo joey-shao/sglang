@@ -32,6 +32,7 @@ from sglang.srt.layers.cp.utils import (
     prepare_cp_forward,
 )
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput
+from sglang.srt.layers.sp_strategy import get_sp_strategy, sp_shard_model_inputs
 from sglang.srt.model_executor.cuda_graph_buffer_registry import (
     build_eager_registry,
 )
@@ -263,6 +264,8 @@ class EagerRunner(BaseRunner):
         ctx = device_timer_ctx(model_runner.device_timer, "decode")
 
         with ctx, pdmux_ctx:
+            if get_sp_strategy() is not None:
+                return self._execute_sp(forward_batch, kwargs)
             return model_runner.model.forward(
                 forward_batch.input_ids,
                 forward_batch.positions,
@@ -340,7 +343,9 @@ class EagerRunner(BaseRunner):
         )
         with device_timer_ctx(model_runner.device_timer, category):
             pcg_runner = model_runner.prefill_cuda_graph_runner
-            if (
+            if get_sp_strategy() is not None:
+                ret = self._execute_sp(forward_batch, kwargs)
+            elif (
                 _is_hip
                 and pcg_runner is not None
                 and not isinstance(pcg_runner, EagerRunner)
@@ -376,6 +381,56 @@ class EagerRunner(BaseRunner):
                     **kwargs,
                 )
         return ret
+
+    def _execute_sp(
+        self, forward_batch: ForwardBatch, kwargs: dict
+    ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
+        """Run the model body on local tokens, then gather before logits."""
+        model = self.model_runner.model
+        strategy = get_sp_strategy()
+        assert strategy is not None
+        if kwargs.get("get_embedding", False):
+            raise ValueError("Ulysses SP does not support embedding models")
+
+        model_kwargs = {}
+        if (pp_proxy_tensors := kwargs.get("pp_proxy_tensors")) is not None:
+            model_kwargs["pp_proxy_tensors"] = pp_proxy_tensors
+
+        with sp_shard_model_inputs(
+            forward_batch.input_ids,
+            forward_batch.positions,
+            forward_batch,
+        ) as (input_ids, positions):
+            hidden_states = model.model(
+                input_ids,
+                positions,
+                forward_batch,
+                **model_kwargs,
+            )
+            capture_aux_hidden_states = getattr(
+                model, "capture_aux_hidden_states", False
+            )
+            aux_hidden_states = None
+            if capture_aux_hidden_states:
+                hidden_states, aux_hidden_states = hidden_states
+
+            if not model.pp_group.is_last_rank:
+                return (
+                    (hidden_states, aux_hidden_states)
+                    if capture_aux_hidden_states
+                    else hidden_states
+                )
+            if aux_hidden_states is not None:
+                raise ValueError("SP logits do not support auxiliary hidden states")
+            hidden_states = strategy.gather_hidden_states(hidden_states, forward_batch)
+
+        return model.logits_processor(
+            forward_batch.input_ids,
+            hidden_states,
+            model.lm_head,
+            forward_batch,
+            aux_hidden_states,
+        )
 
     def _execute_extend_cp_v2(
         self, forward_batch: ForwardBatch, kwargs: dict

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
+from contextlib import nullcontext
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
@@ -618,17 +619,23 @@ class TpModelWorker(BaseTpWorker):
                 "capture_hidden_mode override requires a ScheduleBatch input"
             )
 
+        from sglang.srt.distributed.parallel_state import ulysses_model_tp_scope
+        from sglang.srt.layers.sp_strategy import get_sp_strategy
+
         # Deprecated kwarg: pre-planners mark the batch themselves now.
         forward_batch.apply_deprecated_skip_attn_backend_init(skip_attn_backend_init)
 
         if self.is_dllm():
             return self._forward_batch_generation_dllm(forward_batch, batch)
 
+        sp_strategy = get_sp_strategy()
+
         if self.pp_group.is_last_rank:
-            out = self.model_runner.forward(
-                forward_batch,
-                pp_proxy_tensors=pp_proxy_tensors,
-            )
+            with ulysses_model_tp_scope() if sp_strategy is not None else nullcontext():
+                out = self.model_runner.forward(
+                    forward_batch,
+                    pp_proxy_tensors=pp_proxy_tensors,
+                )
             logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
             batch_result = GenerationBatchResult(
                 logits_output=logits_output,

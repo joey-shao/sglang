@@ -265,6 +265,13 @@ def _init_parallel_groups(
     dcp_size: int,
 ) -> None:
     is_ep_joiner = get_exec().moe.is_ep_joiner
+    if get_parallel().ulysses_sp_size > 1:
+        from sglang.srt.distributed.ulysses_parallel import UlyssesRankLayout
+
+        UlyssesRankLayout(tp_size, get_parallel().ulysses_sp_size).validate_heads(
+            model_config.get_total_num_attention_heads(),
+            model_config.get_total_num_kv_heads(),
+        )
     is_scale_joiner = get_exec().moe.is_ep_scale_joiner
     rank_offset = get_parallel().ep_join_rank_offset if is_scale_joiner else 0
     world_size = (
@@ -292,6 +299,7 @@ def _init_parallel_groups(
         moe_data_model_parallel_size=moe_dp_size,
         decode_context_parallel_size=dcp_size,
         duplicate_tp_group=get_disagg().enable_pdmux,
+        ulysses_sequence_parallel_size=get_parallel().ulysses_sp_size,
         enable_symm_mem=get_exec().comm.enable_symm_mem,
         recovered_rank=is_ep_joiner,
         rank_offset=rank_offset,

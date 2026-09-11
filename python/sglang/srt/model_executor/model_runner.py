@@ -1185,14 +1185,48 @@ class ModelRunner:
         )
 
         with self._load_format_scope(draft_load_format):
-            loaded = load_model_with_memory_saver(
-                model_config=self.model_config,
-                load_config=self.load_config,
-                device=self.device,
-                gpu_id=self.gpu_id,
-                memory_saver_adapter=self.memory_saver_adapter,
-                is_draft_worker=self.is_draft_worker,
-            )
+
+            def load_one(*, model_config, load_config):
+                return load_model_with_memory_saver(
+                    model_config=model_config,
+                    load_config=load_config,
+                    device=self.device,
+                    gpu_id=self.gpu_id,
+                    memory_saver_adapter=self.memory_saver_adapter,
+                    is_draft_worker=self.is_draft_worker,
+                )
+
+            if get_parallel().ulysses_sp_size > 1:
+                from sglang.srt.model_executor.model_runner_components.ulysses_weight_load import (
+                    load_ulysses_model,
+                )
+                from sglang.srt.model_loader.utils import get_model_architecture
+                from sglang.srt.models.qwen3 import Qwen3ForCausalLM
+
+                if self.is_draft_worker:
+                    raise ValueError(
+                        "Ulysses SP loading does not support draft workers"
+                    )
+                if get_model_architecture(self.model_config)[0] is not Qwen3ForCausalLM:
+                    raise ValueError(
+                        "Ulysses requires the native SGLang Qwen3ForCausalLM implementation"
+                    )
+                loaded = load_ulysses_model(
+                    model_config=self.model_config,
+                    load_config=self.load_config,
+                    load_one=load_one,
+                )
+                logger.info(
+                    "Loaded one Qwen3 model for Ulysses: workers=%s, model TP=%s, SP=%s. "
+                    "Fixed SP eager execution enabled.",
+                    self.ps.tp_size,
+                    get_parallel().ulysses_model_tp_group.world_size,
+                    get_parallel().ulysses_sp_size,
+                )
+            else:
+                loaded = load_one(
+                    model_config=self.model_config, load_config=self.load_config
+                )
         self.loader = loaded.loader
         self.model = loaded.model
         self.startup_weight_load = loaded.startup_weight_load

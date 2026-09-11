@@ -70,6 +70,7 @@ if TYPE_CHECKING:
     from sglang.srt.layers.cp.base import BaseContextParallelMetadata
     from sglang.srt.layers.dcp.metadata import DecodeContextParallelMetadata
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+    from sglang.srt.layers.sp_strategy import SPBatchMetadata
     from sglang.srt.managers.schedule_batch import MultimodalInputs, ScheduleBatch
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
@@ -600,6 +601,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     tbo_parent_token_range: Optional[Tuple[int, int]] = None
     tbo_padded_len: Optional[int] = None
     tbo_children: Optional[List[ForwardBatch]] = None
+
+    # Temporary model-input shard layout; request and attention data stay global.
+    sp_metadata: Optional[SPBatchMetadata] = None
 
     attn_cp_metadata: Optional[BaseContextParallelMetadata] = None
 
