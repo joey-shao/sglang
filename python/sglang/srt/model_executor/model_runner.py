@@ -1218,7 +1218,7 @@ class ModelRunner:
                 )
                 logger.info(
                     "Loaded one Qwen3 model for Ulysses: workers=%s, model TP=%s, SP=%s. "
-                    "Fixed SP eager execution enabled.",
+                    "Fixed SP execution enabled.",
                     self.ps.tp_size,
                     get_parallel().ulysses_model_tp_group.world_size,
                     get_parallel().ulysses_sp_size,

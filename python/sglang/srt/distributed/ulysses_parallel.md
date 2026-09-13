@@ -11,8 +11,7 @@ python -m sglang.launch_server \
   --model-path Qwen/Qwen3-8B --dtype bfloat16 \
   --tp-size 4 --ulysses-sp-size 2 \
   --attention-backend fa3 \
-  --disable-overlap-schedule \
-  --disable-prefill-cuda-graph --disable-decode-cuda-graph
+  --disable-prefill-cuda-graph --cuda-graph-backend-decode full
 ```
 
 P=`tp_size` is the total worker count and scheduler communication width.
@@ -31,7 +30,7 @@ restores both on exit. The full-group getter remains stable inside the scope.
 ## Batch and model execution
 
 `ForwardBatch` keeps the ordinary global request, position, and KV metadata.
-At the eager model boundary, `sp_shard_model_inputs` temporarily attaches the
+At the shared eager/decode-graph model boundary, `sp_shard_model_inputs` temporarily attaches the
 SP token layout and slices/pads only the input IDs and positions passed to the
 model. The context restores `sp_metadata` on exit, including exceptions, so
 sampling and result handling continue to see the unchanged global batch.
@@ -53,7 +52,7 @@ global cache locations before invoking the kernel; it never calls backend
 `forward_*` methods. Padding is excluded. Inverse all-to-all restores local tokens and base-TP heads before
 native O projection. Cache head ownership is `tp_rank * S + sp_rank`.
 
-After the model body, the eager runner gathers hidden states across SP and
+After the model body, the shared SP forward gathers hidden states across SP and
 trims padding before calling LogitsProcessor; input IDs and batch metadata
 remain global.
 The same T-sharded LM head gathers vocabulary logits within its TP subgroup.
@@ -63,15 +62,42 @@ reflected in the global view without changing scheduler tensors.
 
 ## Scope and tests
 
-Supported: native dense Qwen3, BF16, FlashAttention fa3/fa4, single-node eager
-text generation, decode, uneven batches, chunked prefill and prefix reuse.
+Supported: native dense Qwen3, BF16, FlashAttention fa3/fa4, single-node
+text generation with eager prefill and eager or full CUDA graph decode, uneven
+batches, chunked prefill and prefix reuse.
 Q/KV head counts must be divisible by P; MLP intermediate size by T. CUDA
-graphs, overlap, PP, DP attention, other CP, EP, speculative decoding, LoRA,
+prefill graphs, non-full decode graphs, torch.compile, two-batch overlap, PP, DP attention,
+other CP, EP, speculative decoding, LoRA,
 quantization, offloading, custom loaders, weight caches, embedding overrides
 and online weight updates are outside the supported scope.
 
 CPU/Gloo tests compare full SP×TP embedding/MLP/LM-head execution and per-rank
 KV contents with a dense reference at SP=2, TP=1/2. They cover padding, cached
 prefix continuation, scope recovery, local/global views and one model load.
-The native 2/4-GPU smoke test is `test/manual/test_ulysses_qwen3_native.py`.
+The native 2/4-GPU decode graph comparison is
+`test/manual/test_ulysses_qwen3_decode_graph.py`. It compares eager/full decode
+with ordinary overlap scheduling both enabled and disabled.
 CPU tests do not validate CUDA kernels or performance.
+
+## Decode CUDA graphs
+
+Decode captures input sharding, all SP/TP communication, the model body, hidden
+state gather and logits in the existing full backend. Prefill graphs are
+explicitly disabled at runner setup for SP. Use `--disable-decode-cuda-graph`
+to compare against eager execution. Ordinary overlap scheduling is allowed;
+use `--disable-overlap-schedule` for the synchronous baseline. The existing
+forward-stream ordering and scheduler shared-read barrier also apply to SP.
+Two-batch overlap remains unsupported.
+
+Each graph uses its global batch bucket B and a local width ceil(B/S). Request
+metadata and KV locations retain B rows. Graph dummy requests use the runner's
+existing padding policy; extra SP alignment tokens are removed before attention
+and KV writes. Replay updates the static inputs and attention metadata, then
+returns only the real request rows. All ranks must replay the same bucket.
+
+The model TP and SP groups participate in the capture context. SP collectives
+use GroupCoordinator so capture selects PyNccl, with flat communication buffers.
+GPU validation is required: CPU layout tests cannot establish CUDA/NCCL or FA
+capture correctness. The communication smoke test is
+`torchrun --standalone --nproc-per-node=2 test/manual/test_ulysses_decode_graph.py`
+(and can also run with 4 ranks).

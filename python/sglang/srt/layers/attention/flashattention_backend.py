@@ -57,7 +57,12 @@ from sglang.kernels.ops.attention.flash_attention import (
 
 
 def _should_disable_scheduler_metadata_precompute() -> bool:
-    return bool(get_parallel().enable_prefill_cp or get_parallel().enable_dp_attention)
+    parallel = get_parallel()
+    return bool(
+        parallel.enable_prefill_cp
+        or parallel.enable_dp_attention
+        or parallel.ulysses_sp_size > 1
+    )
 
 
 @dataclass
@@ -369,6 +374,8 @@ class FlashAttentionBackend(AttentionBackend):
         # A stale precomputed buffer can lead to an OOB read in the split-KV
         # combine kernel (flash_fwd_combine_launch_template.h:52). Leaving
         # scheduler_metadata unset uses the existing per-layer metadata path.
+        # Ulysses redistributes QKV before invoking FA; use that same fallback
+        # so FA sizes metadata from the actual post-exchange attention inputs.
         self._disable_scheduler_metadata_precompute = (
             _should_disable_scheduler_metadata_precompute()
         )

@@ -41,6 +41,7 @@ from sglang.srt.compilation.torch_compile_decoration import set_torch_compile_co
 from sglang.srt.distributed.parallel_state import (
     graph_capture,
     set_pdmux_status,
+    ulysses_model_tp_scope,
 )
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
@@ -56,6 +57,7 @@ from sglang.srt.layers.dp_attention import (
     set_is_extend_in_batch,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.sp_strategy import get_sp_strategy, sp_model_forward
 from sglang.srt.model_executor.cuda_graph_buffer_registry import (
     CudaGraphBufferRegistry,
     build_decode_registry,
@@ -1221,12 +1223,20 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 ):
                     kwargs["input_embeds"] = self.buffers.input_embeds[:num_tokens]
 
-                out = forward(
-                    forward_batch.input_ids,
-                    forward_batch.positions,
-                    forward_batch,
-                    **kwargs,
-                )
+                if get_sp_strategy() is not None:
+                    # Metadata remains global; only model compute uses TP
+                    # subgroups and the bucket's fixed local token shards.
+                    with ulysses_model_tp_scope():
+                        out = sp_model_forward(
+                            self.model_runner.model, forward_batch, **kwargs
+                        )
+                else:
+                    out = forward(
+                        forward_batch.input_ids,
+                        forward_batch.positions,
+                        forward_batch,
+                        **kwargs,
+                    )
                 for capture_hook in self.model_runner.capture_tail_hooks:
                     capture_hook(self, out, forward_batch, num_tokens)
                 return out

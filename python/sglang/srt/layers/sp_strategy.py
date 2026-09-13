@@ -9,7 +9,6 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable
 
 import torch
-import torch.distributed as dist
 import torch.nn.functional as F
 
 from sglang.srt.runtime_context import get_parallel
@@ -55,20 +54,21 @@ class SPBatchMetadata:
 
 
 def _collective(op, output, input_tensor, group):
-    getattr(dist, op)(output, input_tensor, group=getattr(group, "device_group", group))
+    collective = getattr(group, op, None)
+    collective(output.view(-1), input_tensor.view(-1))
 
 
 def exchange_qkv(q, k, v, *, metadata: SPBatchMetadata, group):
     """Local tokens / base-TP heads -> global real tokens / full-TP heads."""
     parts = [x.reshape(metadata.local_tokens, metadata.sp_size, -1) for x in (q, k, v)]
     widths = [x.shape[-1] for x in parts]
-    packed = torch.cat(parts, dim=-1).transpose(0, 1).contiguous()
-    received = torch.empty_like(packed)
-    _collective("all_to_all_single", received, packed, group)
+    qkv = torch.cat(parts, dim=-1).transpose(0, 1).contiguous()
+    received = torch.empty_like(qkv)
+    _collective("all_to_all_single", received, qkv, group)
     # Padding never reaches the backend or out_cache_loc: metadata stays global
     # and describes only real tokens, including cached-prefix/chunk boundaries.
-    real = received.reshape(metadata.padded_tokens, -1)[: metadata.num_tokens]
-    return tuple(x.contiguous() for x in real.split(widths, dim=-1))
+    qkv_ = received.reshape(metadata.padded_tokens, -1)[: metadata.num_tokens]
+    return tuple(x.contiguous() for x in qkv_.split(widths, dim=-1))
 
 
 def exchange_attention_output(output, *, metadata: SPBatchMetadata, group):
@@ -106,10 +106,6 @@ def sp_shard_model_inputs(input_ids, positions, forward_batch):
         yield input_ids, positions
         return
 
-    had_sp_metadata = hasattr(forward_batch, "sp_metadata")
-    sp_metadata_backup = getattr(forward_batch, "sp_metadata", None)
-    if sp_metadata_backup is not None:
-        raise ValueError("ForwardBatch is already sharded for SP")
     if positions.ndim != 1:
         raise ValueError("SP requires one-dimensional positions")
     for name in ("input_embeds", "replace_embeds", "replace_positions"):
@@ -126,10 +122,7 @@ def sp_shard_model_inputs(input_ids, positions, forward_batch):
     try:
         yield sharded_input_ids, sharded_positions
     finally:
-        if had_sp_metadata:
-            forward_batch.sp_metadata = sp_metadata_backup
-        else:
-            delattr(forward_batch, "sp_metadata")
+        delattr(forward_batch, "sp_metadata")
 
 
 class UlyssesParallelStrategy:
@@ -213,3 +206,54 @@ class UlyssesParallelStrategy:
         return exchange_attention_output(
             output, metadata=metadata, group=get_parallel().ulysses_sp_group
         )
+
+
+def sp_model_forward(model, forward_batch, **kwargs):
+    """Run local SP tokens and gather global hidden states before logits.
+
+    The caller owns the model TP scope. During decode graph capture the input
+    views describe the fixed global bucket, including graph dummy requests;
+    only the additional SP alignment padding is removed inside attention.
+    """
+    strategy = get_sp_strategy()
+    assert strategy is not None
+    if kwargs.get("get_embedding", False):
+        raise ValueError("Ulysses SP does not support embedding models")
+
+    model_kwargs = {}
+    if (pp_proxy_tensors := kwargs.get("pp_proxy_tensors")) is not None:
+        model_kwargs["pp_proxy_tensors"] = pp_proxy_tensors
+
+    with sp_shard_model_inputs(
+        forward_batch.input_ids,
+        forward_batch.positions,
+        forward_batch,
+    ) as (input_ids, positions):
+        hidden_states = model.model(
+            input_ids,
+            positions,
+            forward_batch,
+            **model_kwargs,
+        )
+        capture_aux_hidden_states = getattr(model, "capture_aux_hidden_states", False)
+        aux_hidden_states = None
+        if capture_aux_hidden_states:
+            hidden_states, aux_hidden_states = hidden_states
+
+        if not model.pp_group.is_last_rank:
+            return (
+                (hidden_states, aux_hidden_states)
+                if capture_aux_hidden_states
+                else hidden_states
+            )
+        if aux_hidden_states is not None:
+            raise ValueError("SP logits do not support auxiliary hidden states")
+        hidden_states = strategy.gather_hidden_states(hidden_states, forward_batch)
+
+    return model.logits_processor(
+        forward_batch.input_ids,
+        hidden_states,
+        model.lm_head,
+        forward_batch,
+        aux_hidden_states,
+    )
