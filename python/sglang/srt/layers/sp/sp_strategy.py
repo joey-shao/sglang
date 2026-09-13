@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import copy
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Callable
 
 import torch
@@ -15,6 +15,11 @@ from sglang.srt.runtime_context import get_parallel
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache, KVWriteLoc
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+    from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
+        PrefillCudaGraphRunner,
+    )
+    from sglang.srt.model_executor.runner.shape_key import ShapeKey
 
 
 @dataclass(frozen=True)
@@ -33,6 +38,17 @@ class SPBatchMetadata:
     num_tokens: int
     sp_size: int
     sp_rank: int
+    # BCG keeps the bucket layout fixed while attention runs eagerly on the
+    # live prefix. Decode graphs leave this unset (dummy requests are valid).
+    real_num_tokens: int | None = None
+
+    @property
+    def attention_tokens(self):
+        return self.num_tokens if self.real_num_tokens is None else self.real_num_tokens
+
+    def __post_init__(self):
+        if not 0 <= self.attention_tokens <= self.num_tokens:
+            raise ValueError("SP real token count must fit the bucket")
 
     @property
     def local_tokens(self):
@@ -67,13 +83,17 @@ def exchange_qkv(q, k, v, *, metadata: SPBatchMetadata, group):
     _collective("all_to_all_single", received, qkv, group)
     # Padding never reaches the backend or out_cache_loc: metadata stays global
     # and describes only real tokens, including cached-prefix/chunk boundaries.
-    qkv_ = received.reshape(metadata.padded_tokens, -1)[: metadata.num_tokens]
+    qkv_ = received.reshape(metadata.padded_tokens, -1)[: metadata.attention_tokens]
     return tuple(x.contiguous() for x in qkv_.split(widths, dim=-1))
 
 
 def exchange_attention_output(output, *, metadata: SPBatchMetadata, group):
-    output = output.reshape(metadata.num_tokens, -1)
-    padded = F.pad(output, (0, 0, 0, metadata.padded_tokens - metadata.num_tokens))
+    output = output.flatten(start_dim=1)
+    if output.shape[0] != metadata.attention_tokens:
+        raise ValueError("SP attention output does not match real token count")
+    padded = F.pad(
+        output, (0, 0, 0, metadata.padded_tokens - metadata.attention_tokens)
+    )
     received = torch.empty_like(padded)
     _collective("all_to_all_single", received, padded.contiguous(), group)
     return (
@@ -98,28 +118,45 @@ def get_sp_strategy():
     return _STRATEGY
 
 
-@contextmanager
-def sp_shard_model_inputs(input_ids, positions, forward_batch):
-    """Shard model inputs while keeping ``forward_batch`` in global layout."""
-    strategy = get_sp_strategy()
-    if strategy is None:
-        yield input_ids, positions
-        return
+def prepare_sp_forward(
+    forward_batch: ForwardBatch, *, real_num_tokens: int | None = None
+) -> None:
+    """Build SP metadata for a global batch without slicing its tensors.
 
-    if positions.ndim != 1:
+    Input length defines the token layout (the fixed bucket for graphs).
+    BCG replay supplies the live attention extent separately; eager forwards
+    and decode capture use every input row. Rebuild on each call so reused
+    batches cannot retain a previous replay's real token count.
+    """
+    strategy = get_sp_strategy()
+    assert strategy is not None
+
+    if forward_batch.positions.ndim != 1:
         raise ValueError("SP requires one-dimensional positions")
     for name in ("input_embeds", "replace_embeds", "replace_positions"):
         if getattr(forward_batch, name, None) is not None:
             raise ValueError("SP does not support embedding overrides")
 
-    metadata = strategy.build_metadata(num_tokens=input_ids.numel())
-    if positions.shape[0] != metadata.num_tokens:
+    metadata = strategy.build_metadata(
+        num_tokens=forward_batch.input_ids.numel(), real_num_tokens=real_num_tokens
+    )
+    if forward_batch.positions.shape[0] != metadata.num_tokens:
         raise ValueError("SP positions do not match the global token count")
-    sharded_input_ids = metadata.slice_tokens(input_ids)
-    sharded_positions = metadata.slice_tokens(positions)
-
     forward_batch.sp_metadata = metadata
+
+
+@contextmanager
+def sp_shard_model_inputs(input_ids, positions, forward_batch):
+    """Shard model inputs while keeping ``forward_batch`` in global layout."""
+    if get_sp_strategy() is None:
+        yield input_ids, positions
+        return
+
+    prepare_sp_forward(forward_batch)
     try:
+        metadata = forward_batch.sp_metadata
+        sharded_input_ids = metadata.slice_tokens(input_ids)
+        sharded_positions = metadata.slice_tokens(positions)
         yield sharded_input_ids, sharded_positions
     finally:
         delattr(forward_batch, "sp_metadata")
@@ -131,11 +168,14 @@ class UlyssesParallelStrategy:
     def __init__(self, *, sp_size):
         self.sp_size = sp_size
 
-    def build_metadata(self, *, num_tokens: int) -> SPBatchMetadata:
+    def build_metadata(
+        self, *, num_tokens: int, real_num_tokens: int | None = None
+    ) -> SPBatchMetadata:
         return SPBatchMetadata(
             num_tokens=num_tokens,
             sp_size=self.sp_size,
             sp_rank=get_parallel().ulysses_sp_group.rank_in_group,
+            real_num_tokens=real_num_tokens,
         )
 
     def gather_hidden_states(self, hidden_states, batch):
@@ -256,4 +296,111 @@ def sp_model_forward(model, forward_batch, **kwargs):
         model.lm_head,
         forward_batch,
         aux_hidden_states,
+    )
+
+
+@dataclass
+class PrefillSPBCGInput:
+    """Fixed-address SP-local inputs and per-bucket replay state.
+
+    The captured body consumes local input_embeds instead of input_ids (the
+    model's forward must accept input_embeds). Request and KV metadata stay
+    global; the original batch is used for logits.
+    """
+
+    input_embeds: torch.Tensor
+    positions: torch.Tensor
+    bucket_local_tokens: dict[int, int] = field(default_factory=dict)
+    live_local_tokens: int = 0
+
+    @classmethod
+    def create(cls, runner: PrefillCudaGraphRunner) -> PrefillSPBCGInput:
+        strategy = get_sp_strategy()
+        assert strategy is not None
+        capacity = (runner.max_num_tokens + strategy.sp_size - 1) // strategy.sp_size
+        with torch.device(runner.device):
+            return cls(
+                input_embeds=torch.zeros(
+                    (capacity, runner.model_runner.model_config.hidden_size),
+                    dtype=runner.model_runner.dtype,
+                ),
+                positions=torch.zeros(capacity, dtype=torch.int64),
+            )
+
+    def prepare(
+        self,
+        runner: PrefillCudaGraphRunner,
+        forward_batch: ForwardBatch,
+        *,
+        static_num_tokens: int,
+        capture: bool,
+    ) -> None:
+        """Refresh metadata and copy the local shard before capture/replay."""
+        if forward_batch.input_ids.numel() != static_num_tokens:
+            raise ValueError("SP prefill inputs must match the global token bucket")
+        prepare_sp_forward(
+            forward_batch,
+            real_num_tokens=None if capture else int(forward_batch.extend_num_tokens),
+        )
+        metadata = forward_batch.sp_metadata
+        local_tokens = metadata.local_tokens
+        if not capture:
+            captured = self.bucket_local_tokens.get(static_num_tokens)
+            if captured is None:
+                raise RuntimeError(
+                    f"Missing SP-local capture capacity for bucket {static_num_tokens}"
+                )
+            if captured != local_tokens:
+                raise RuntimeError("SP prefill replay layout differs from capture")
+        if local_tokens > min(self.input_embeds.shape[0], self.positions.numel()):
+            raise RuntimeError("SP prefill bucket exceeds local input buffer capacity")
+        if capture:
+            self.bucket_local_tokens[static_num_tokens] = local_tokens
+
+        start = metadata.sp_rank * local_tokens
+        live = min(local_tokens, max(0, metadata.attention_tokens - start))
+        global_input_embeds = runner.model_runner.model.get_input_embeddings()(
+            forward_batch.input_ids[: metadata.attention_tokens]
+        )
+        self.input_embeds[:local_tokens].zero_()
+        self.positions[:local_tokens].zero_()
+        self.input_embeds[:live].copy_(global_input_embeds[start : start + live])
+        self.positions[:live].copy_(forward_batch.positions[start : start + live])
+        forward_batch.input_embeds = self.input_embeds[:local_tokens]
+        forward_batch.positions = self.positions[:local_tokens]
+        self.live_local_tokens = live
+
+
+def execute_prefill_sp_bcg(
+    runner: PrefillCudaGraphRunner,
+    forward_batch: ForwardBatch,
+    static_forward_batch: ForwardBatch,
+    static_num_tokens: int,
+    raw_num_tokens: int,
+    shape_key: ShapeKey,
+):
+    """Replay the local SP body, then gather and compute logits eagerly.
+
+    The caller owns the model TP scope and the backend replay session.
+    """
+    with runner._prefill_forward_context(
+        static_forward_batch,
+        num_tokens=static_num_tokens,
+        raw_num_tokens=raw_num_tokens,
+    ):
+        hidden_states = runner.backend.replay(shape_key, static_forward_batch)
+    strategy = get_sp_strategy()
+    assert strategy is not None
+    # Gather using the bucket's local layout before trimming to live tokens.
+    # Logits then use the original global request metadata.
+    hidden_states = strategy.gather_hidden_states(hidden_states, static_forward_batch)
+    forward_batch.next_token_logits_buffer = (
+        static_forward_batch.next_token_logits_buffer
+    )
+    model = runner.model_runner.model
+    return model.logits_processor(
+        forward_batch.input_ids,
+        hidden_states[:raw_num_tokens],
+        model.lm_head,
+        forward_batch,
     )

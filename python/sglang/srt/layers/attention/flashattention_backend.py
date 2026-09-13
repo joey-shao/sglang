@@ -1249,7 +1249,7 @@ class FlashAttentionBackend(AttentionBackend):
         rel_bias=None,
         rel_bias_event=None,
     ):
-        from sglang.srt.layers.sp_strategy import SPKVWrite, get_sp_strategy
+        from sglang.srt.layers.sp.sp_strategy import SPKVWrite, get_sp_strategy
 
         if (
             getattr(forward_batch, "sp_metadata", None) is not None
@@ -1891,7 +1891,7 @@ class FlashAttentionBackend(AttentionBackend):
         rel_bias=None,
         rel_bias_event=None,
     ) -> torch.Tensor:
-        from sglang.srt.layers.sp_strategy import SPKVWrite, get_sp_strategy
+        from sglang.srt.layers.sp.sp_strategy import SPKVWrite, get_sp_strategy
 
         if (
             getattr(forward_batch, "sp_metadata", None) is not None

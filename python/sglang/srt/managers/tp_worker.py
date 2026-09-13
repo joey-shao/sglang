@@ -620,7 +620,7 @@ class TpModelWorker(BaseTpWorker):
             )
 
         from sglang.srt.distributed.parallel_state import ulysses_model_tp_scope
-        from sglang.srt.layers.sp_strategy import get_sp_strategy
+        from sglang.srt.layers.sp.sp_strategy import get_sp_strategy
 
         # Deprecated kwarg: pre-planners mark the batch themselves now.
         forward_batch.apply_deprecated_skip_attn_backend_init(skip_attn_backend_init)

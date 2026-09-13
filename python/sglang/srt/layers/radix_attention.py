@@ -324,6 +324,41 @@ def _unified_attention_with_output_impl(
     forward_batch = context.forward_batch
     attention_layers = context.attention_layers
     attention_layer = attention_layers[layer_id]
+    if getattr(forward_batch, "sp_metadata", None) is not None:
+        # BCG Q/K/V and output have fixed LOCAL bucket rows. The SP strategy
+        # removes global padding only AFTER all-to-all, and returns the same
+        # local shape, including ranks whose shard has no real tokens.
+        if (
+            return_lse
+            or use_mha_companion
+            or any(
+                x is not None
+                for x in (
+                    key_value_num_tokens,
+                    q_rope,
+                    k_rope,
+                    sinks,
+                    attn_sink,
+                    cos_sin_cache,
+                    is_neox,
+                    llama_4_scaling,
+                    topk_indices,
+                )
+            )
+        ):
+            raise ValueError("SP breakable attention requires dense Qwen3 attention")
+        original_loc = forward_batch.out_cache_loc
+        try:
+            forward_batch.out_cache_loc = original_loc[
+                : forward_batch.sp_metadata.attention_tokens
+            ]
+            ret = get_attn_backend().forward(
+                query, key, value, attention_layer, forward_batch, save_kv_cache
+            )
+            output.view(ret.shape).copy_(ret)
+        finally:
+            forward_batch.out_cache_loc = original_loc
+        return None
     real_query_num_tokens = forward_batch.global_num_token_non_padded_cpu
     # Ordinary PCG attention pads Q/K/V to the same token bucket. Prefix MHA
     # instead supplies a fixed-capacity K/V chunk whose extent is independent

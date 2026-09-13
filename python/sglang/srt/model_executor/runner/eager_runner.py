@@ -32,7 +32,7 @@ from sglang.srt.layers.cp.utils import (
     prepare_cp_forward,
 )
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput
-from sglang.srt.layers.sp_strategy import get_sp_strategy, sp_model_forward
+from sglang.srt.layers.sp.sp_strategy import get_sp_strategy, sp_model_forward
 from sglang.srt.model_executor.cuda_graph_buffer_registry import (
     build_eager_registry,
 )

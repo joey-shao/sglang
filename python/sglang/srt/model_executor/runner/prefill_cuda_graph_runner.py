@@ -42,7 +42,7 @@ import dataclasses
 import inspect
 import logging
 from collections.abc import Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, Optional, Union
 
@@ -52,7 +52,7 @@ import tqdm
 from sglang.kernels.ops.kvcache.kv_indices import (
     create_chunked_prefix_cache_kv_indices,
 )
-from sglang.srt.distributed.parallel_state import graph_capture
+from sglang.srt.distributed.parallel_state import graph_capture, ulysses_model_tp_scope
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.cp.bcg import (
     PrefillCPBCGInput,
@@ -75,6 +75,11 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput
+from sglang.srt.layers.sp.sp_strategy import (
+    PrefillSPBCGInput,
+    execute_prefill_sp_bcg,
+    get_sp_strategy,
+)
 from sglang.srt.model_executor.cuda_graph_buffer_registry import (
     CudaGraphBufferRegistry,
     build_prefill_registry,
@@ -417,6 +422,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self._capture_lora = False
         self.enable_cp_v2_bcg_capture = False
         self.prefill_cp_bcg_input: Optional[PrefillCPBCGInput] = None
+        self.prefill_sp_bcg_input: Optional[PrefillSPBCGInput] = None
         # TcPiecewise does its compile pass during backend construction.
         # Wrap only that path with the prefill CUDA graph failure hint.
         try:
@@ -521,6 +527,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 self.capture_num_tokens, server_args
             )
             self.prefill_cp_bcg_input = PrefillCPBCGInput.create(self)
+
+        if get_sp_strategy() is not None:
+            self.prefill_sp_bcg_input = PrefillSPBCGInput.create(self)
 
         # Static hidden_states buffer giving the captured graph a stable
         # address; load_batch refreshes it from live spec_info at replay.
@@ -736,7 +745,14 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         )
         set_is_extend_in_batch(False)
 
-        with self._prefill_forward_context(forward_batch):
+        with (
+            (
+                ulysses_model_tp_scope()
+                if get_sp_strategy() is not None
+                else nullcontext()
+            ),
+            self._prefill_forward_context(forward_batch),
+        ):
             pp_proxy_tensors = self._capture_pp_proxy_tensors(num_tokens)
             if self._uses_eager_prefill_tail():
                 # BCG / Full: capture the transformer body only.
@@ -1496,6 +1512,14 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         else:
             self._init_forward_metadata_for_capture(forward_batch, num_tokens)
 
+        if get_sp_strategy() is not None:
+            # Plan attention against global inputs before replacing the model
+            # input views with local SP buffers, just as replay preparation does.
+            assert self.prefill_sp_bcg_input is not None
+            self.prefill_sp_bcg_input.prepare(
+                self, forward_batch, static_num_tokens=num_tokens, capture=True
+            )
+
         def run_once():
             return self._run_forward(forward_batch, num_tokens)
 
@@ -1760,6 +1784,16 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             metadata_forward_batch, static_forward_batch, static_num_tokens
         )
 
+        if get_sp_strategy() is not None:
+            # Eager attention callbacks read this live view during BCG replay;
+            # graph segments retain the capture bucket's local token layout.
+            assert self.prefill_sp_bcg_input is not None
+            self.prefill_sp_bcg_input.prepare(
+                self,
+                static_forward_batch,
+                static_num_tokens=static_num_tokens,
+                capture=False,
+            )
         return static_forward_batch
 
     def _execute_body_capture(
@@ -1902,6 +1936,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self._validate_capture_hidden_mode(forward_batch)
         with self.backend.replay_session():
             static_forward_batch = self.load_batch(forward_batch, **kwargs)
+            sp_metadata = getattr(static_forward_batch, "sp_metadata", None)
             static_num_tokens = len(static_forward_batch.input_ids)
             raw_num_tokens = self.raw_num_tokens
             shape_key = self._shape_key(static_num_tokens, forward_batch)
@@ -1922,6 +1957,15 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     static_num_tokens,
                     raw_num_tokens,
                     **kwargs,
+                )
+            elif get_sp_strategy() is not None:
+                output = execute_prefill_sp_bcg(
+                    self,
+                    forward_batch,
+                    static_forward_batch,
+                    static_num_tokens,
+                    raw_num_tokens,
+                    shape_key,
                 )
             elif self._uses_eager_prefill_tail():
                 output = self._execute_body_capture(

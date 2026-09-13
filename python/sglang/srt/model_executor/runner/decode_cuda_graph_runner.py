@@ -57,7 +57,7 @@ from sglang.srt.layers.dp_attention import (
     set_is_extend_in_batch,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.layers.sp_strategy import get_sp_strategy, sp_model_forward
+from sglang.srt.layers.sp.sp_strategy import get_sp_strategy, sp_model_forward
 from sglang.srt.model_executor.cuda_graph_buffer_registry import (
     CudaGraphBufferRegistry,
     build_decode_registry,

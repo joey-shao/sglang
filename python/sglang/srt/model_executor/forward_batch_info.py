@@ -70,7 +70,7 @@ if TYPE_CHECKING:
     from sglang.srt.layers.cp.base import BaseContextParallelMetadata
     from sglang.srt.layers.dcp.metadata import DecodeContextParallelMetadata
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-    from sglang.srt.layers.sp_strategy import SPBatchMetadata
+    from sglang.srt.layers.sp.sp_strategy import SPBatchMetadata
     from sglang.srt.managers.schedule_batch import MultimodalInputs, ScheduleBatch
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
