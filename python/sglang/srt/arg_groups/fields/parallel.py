@@ -58,7 +58,7 @@ class Parallel:
     ] = 1
     ulysses_sp_size: A[
         int,
-        "Ulysses sequence parallelism size. Divides --tp-size (the total worker count); the entire model uses TP subgroups of tp_size / ulysses_sp_size ranks, with token shards across SP. Requires FlashAttention (fa3/fa4), eager or breakable CUDA graph prefill, and eager or full CUDA graph decode. Supports ordinary overlap scheduling; two-batch overlap is unsupported. Cannot be combined with attention context parallelism, decode context parallelism, or DP attention.",
+        "Ulysses sequence parallelism size. Divides --tp-size (the total worker count); the entire model uses TP subgroups of tp_size / ulysses_sp_size ranks, with token shards across SP. Requires FlashAttention (fa3/fa4) or Triton attention, eager or breakable CUDA graph prefill, and eager or full CUDA graph decode. Supports ordinary overlap scheduling; two-batch overlap is unsupported. Cannot be combined with attention context parallelism, decode context parallelism, or DP attention.",
     ] = 1
     dcp_size: A[
         int,

@@ -1229,6 +1229,105 @@ class FlashAttentionBackend(AttentionBackend):
             k_rope = k_rope.to(self.kv_cache_dtype) if k_rope is not None else None
         return q, q_rope, k_rope, k_descale, v_descale
 
+    def _forward_sp(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        save_kv_cache=True,
+        q_rope: Optional[torch.Tensor] = None,
+        k_rope: Optional[torch.Tensor] = None,
+        sinks: Optional[torch.Tensor] = None,
+        q_descale: Optional[torch.Tensor] = None,
+        k_descale: Optional[torch.Tensor] = None,
+        v_descale: Optional[torch.Tensor] = None,
+        score_mod=None,
+        aux_tensors=None,
+        rel_bias=None,
+        rel_bias_event=None,
+        *,
+        is_decode: bool,
+    ):
+        from sglang.srt.layers.sp.sp_strategy import SPKVWrite, get_sp_strategy
+
+        strategy = get_sp_strategy()
+        if any(
+            value is not None
+            for value in (
+                q_rope,
+                k_rope,
+                sinks,
+                q_descale,
+                k_descale,
+                v_descale,
+                score_mod,
+                aux_tensors,
+                rel_bias,
+                rel_bias_event,
+            )
+        ):
+            raise ValueError("SP QKV redistribution requires dense attention inputs")
+        # Fixed Qwen3 SP supports dense causal attention with BF16 KV.
+        # Keep kernel selection here; the strategy owns QKV exchange and KV writes.
+        if (
+            self.use_mla
+            or self.fa_skip_kv_cache
+            or self.has_local_attention
+            or layer.is_cross_attention
+            or layer.attn_type != AttentionType.DECODER
+            or (
+                layer.sliding_window_size is not None
+                and layer.sliding_window_size > -1
+            )
+        ):
+            raise ValueError("Ulysses requires dense causal attention with KV cache")
+        metadata = self.forward_metadata
+        key_cache, value_cache = self.get_paged_mha_kv_cache(
+            layer, head_group_num=strategy.sp_size
+        )
+        kernel_kwargs = {}
+        if is_decode:
+            kernel_kwargs["scheduler_metadata"] = metadata.scheduler_metadata
+            if self._decode_uses_static_max_seqlen_k:
+                kernel_kwargs["max_seqlen_k"] = metadata.max_seq_len_k
+        else:
+            kernel_kwargs["cu_seqlens_k_new"] = metadata.cu_seqlens_k
+        attention_kernel = partial(
+            flash_attn_with_kvcache,
+            k_cache=key_cache,
+            v_cache=value_cache,
+            page_table=metadata.page_table,
+            cache_seqlens=metadata.cache_seqlens_int32,
+            cu_seqlens_q=metadata.cu_seqlens_q,
+            max_seqlen_q=metadata.max_seq_len_q,
+            softmax_scale=layer.scaling,
+            causal=True,
+            window_size=(-1, -1),
+            softcap=layer.logit_cap,
+            num_splits=self.decode_num_splits if is_decode else self.num_splits,
+            ver=self.fa_impl_ver,
+            **kernel_kwargs,
+        )
+        kv_write = SPKVWrite(
+            pool=self.token_to_kv_pool,
+            location=KVWriteLoc(
+                forward_batch.out_cache_loc,
+                metadata.swa_out_cache_loc,
+            ),
+            enabled=save_kv_cache,
+        )
+        return strategy.forward_attention(
+            q,
+            k,
+            v,
+            layer,
+            forward_batch,
+            attention_kernel=lambda q, k, v, layer: attention_kernel(q=q),
+            kv_write=kv_write,
+        )
+
     def forward_extend(
         self,
         q: torch.Tensor,
@@ -1249,85 +1348,28 @@ class FlashAttentionBackend(AttentionBackend):
         rel_bias=None,
         rel_bias_event=None,
     ):
-        from sglang.srt.layers.sp.sp_strategy import SPKVWrite, get_sp_strategy
-
         if (
             getattr(forward_batch, "sp_metadata", None) is not None
             and not forward_batch.forward_mode.is_idle()
         ):
-            strategy = get_sp_strategy()
-            if any(
-                value is not None
-                for value in (
-                    q_rope,
-                    k_rope,
-                    sinks,
-                    q_descale,
-                    k_descale,
-                    v_descale,
-                    score_mod,
-                    aux_tensors,
-                    rel_bias,
-                    rel_bias_event,
-                )
-            ):
-                raise ValueError(
-                    "SP QKV redistribution requires dense attention inputs"
-                )
-            # Fixed Qwen3 SP supports dense causal attention with BF16 KV.
-            # Keep kernel selection here; the strategy owns QKV exchange and KV writes.
-            if (
-                self.use_mla
-                or self.fa_skip_kv_cache
-                or self.has_local_attention
-                or layer.is_cross_attention
-                or layer.attn_type != AttentionType.DECODER
-                or (
-                    layer.sliding_window_size is not None
-                    and layer.sliding_window_size > -1
-                )
-            ):
-                raise ValueError(
-                    "Ulysses requires dense causal attention with KV cache"
-                )
-            metadata = self.forward_metadata
-            key_cache, value_cache = self.get_paged_mha_kv_cache(
-                layer, head_group_num=strategy.sp_size
-            )
-            kernel_kwargs = {}
-            kernel_kwargs["cu_seqlens_k_new"] = metadata.cu_seqlens_k
-            attention_kernel = partial(
-                flash_attn_with_kvcache,
-                k_cache=key_cache,
-                v_cache=value_cache,
-                page_table=metadata.page_table,
-                cache_seqlens=metadata.cache_seqlens_int32,
-                cu_seqlens_q=metadata.cu_seqlens_q,
-                max_seqlen_q=metadata.max_seq_len_q,
-                softmax_scale=layer.scaling,
-                causal=True,
-                window_size=(-1, -1),
-                softcap=layer.logit_cap,
-                num_splits=self.num_splits,
-                ver=self.fa_impl_ver,
-                **kernel_kwargs,
-            )
-            kv_write = SPKVWrite(
-                pool=self.token_to_kv_pool,
-                location=KVWriteLoc(
-                    forward_batch.out_cache_loc,
-                    metadata.swa_out_cache_loc,
-                ),
-                enabled=save_kv_cache,
-            )
-            return strategy.forward_attention(
+            return self._forward_sp(
                 q,
                 k,
                 v,
                 layer,
                 forward_batch,
-                attention_kernel=attention_kernel,
-                kv_write=kv_write,
+                save_kv_cache=save_kv_cache,
+                q_rope=q_rope,
+                k_rope=k_rope,
+                sinks=sinks,
+                q_descale=q_descale,
+                k_descale=k_descale,
+                v_descale=v_descale,
+                score_mod=score_mod,
+                aux_tensors=aux_tensors,
+                rel_bias=rel_bias,
+                rel_bias_event=rel_bias_event,
+                is_decode=False,
             )
 
         if score_mod is not None and self.fa_impl_ver != 4:
@@ -1891,87 +1933,28 @@ class FlashAttentionBackend(AttentionBackend):
         rel_bias=None,
         rel_bias_event=None,
     ) -> torch.Tensor:
-        from sglang.srt.layers.sp.sp_strategy import SPKVWrite, get_sp_strategy
-
         if (
             getattr(forward_batch, "sp_metadata", None) is not None
             and not forward_batch.forward_mode.is_idle()
         ):
-            strategy = get_sp_strategy()
-            if any(
-                value is not None
-                for value in (
-                    q_rope,
-                    k_rope,
-                    sinks,
-                    q_descale,
-                    k_descale,
-                    v_descale,
-                    score_mod,
-                    aux_tensors,
-                    rel_bias,
-                    rel_bias_event,
-                )
-            ):
-                raise ValueError(
-                    "SP QKV redistribution requires dense attention inputs"
-                )
-            # Fixed Qwen3 SP supports dense causal attention with BF16 KV.
-            # Keep kernel selection here; the strategy owns QKV exchange and KV writes.
-            if (
-                self.use_mla
-                or self.fa_skip_kv_cache
-                or self.has_local_attention
-                or layer.is_cross_attention
-                or layer.attn_type != AttentionType.DECODER
-                or (
-                    layer.sliding_window_size is not None
-                    and layer.sliding_window_size > -1
-                )
-            ):
-                raise ValueError(
-                    "Ulysses requires dense causal attention with KV cache"
-                )
-            metadata = self.forward_metadata
-            key_cache, value_cache = self.get_paged_mha_kv_cache(
-                layer, head_group_num=strategy.sp_size
-            )
-            kernel_kwargs = {}
-            kernel_kwargs["scheduler_metadata"] = metadata.scheduler_metadata
-            if self._decode_uses_static_max_seqlen_k:
-                kernel_kwargs["max_seqlen_k"] = metadata.max_seq_len_k
-            attention_kernel = partial(
-                flash_attn_with_kvcache,
-                k_cache=key_cache,
-                v_cache=value_cache,
-                page_table=metadata.page_table,
-                cache_seqlens=metadata.cache_seqlens_int32,
-                cu_seqlens_q=metadata.cu_seqlens_q,
-                max_seqlen_q=metadata.max_seq_len_q,
-                softmax_scale=layer.scaling,
-                causal=True,
-                window_size=(-1, -1),
-                softcap=layer.logit_cap,
-                num_splits=self.decode_num_splits,
-                ver=self.fa_impl_ver,
-                **kernel_kwargs,
-            )
-            kv_write = SPKVWrite(
-                pool=self.token_to_kv_pool,
-                location=KVWriteLoc(
-                    forward_batch.out_cache_loc,
-                    metadata.swa_out_cache_loc,
-                ),
-                enabled=save_kv_cache,
-            )
-            return strategy.forward_attention(
+            return self._forward_sp(
                 q,
                 k,
                 v,
                 layer,
                 forward_batch,
-                attention_kernel=attention_kernel,
-                kv_write=kv_write,
+                save_kv_cache=save_kv_cache,
+                q_rope=q_rope,
+                k_rope=k_rope,
+                sinks=sinks,
+                q_descale=q_descale,
+                k_descale=k_descale,
+                v_descale=v_descale,
+                score_mod=score_mod,
+                aux_tensors=aux_tensors,
+                rel_bias=rel_bias,
+                rel_bias_event=rel_bias_event,
+                is_decode=True,
             )
         if score_mod is not None and self.fa_impl_ver != 4:
             raise RuntimeError("score_mod is only supported by the FA4 backend.")

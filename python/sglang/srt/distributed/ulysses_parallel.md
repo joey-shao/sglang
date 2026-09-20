@@ -14,6 +14,8 @@ python -m sglang.launch_server \
   --cuda-graph-backend-prefill breakable --cuda-graph-backend-decode full
 ```
 
+Select `--attention-backend triton` to use the Triton backend instead.
+
 P=`tp_size` is the total worker count and scheduler communication width.
 S=`ulysses_sp_size` divides P, and T=P/S is the model TP width. Embedding,
 QKV/O projections, MLP and LM head all use T-way TP. With P=4 and S=2, TP
@@ -42,14 +44,16 @@ token shards. All model weights are constructed/loaded under the same subgroup.
 
 ## Attention and output
 
-FlashAttention metadata initialization uses the global batch directly.
-Only `FlashAttentionBackend.forward_extend` and `forward_decode` contain SP
-dispatch. `sp_strategy.forward_attention` exchanges local-token/base-TP-head
+FlashAttention and Triton metadata initialization use the global batch directly.
+Their `forward_extend` and `forward_decode` methods contain SP dispatch.
+`sp_strategy.forward_attention` exchanges local-token/base-TP-head
 QKV into global-real-token/full-worker-head layout before cache writes. The
-backend passes `flash_attn_with_kvcache` directly, with the FA3/FA4 version
-and phase-specific global metadata. The strategy writes redistributed KV to
-global cache locations before invoking the kernel; it never calls backend
-`forward_*` methods. Padding is excluded. Inverse all-to-all restores local tokens and base-TP heads before
+strategy writes redistributed KV to global cache locations, then passes Q/K/V
+and the reduced attention head layout to a backend callback. FlashAttention
+uses `flash_attn_with_kvcache` with phase-specific global metadata. Triton
+dispatches its extend/decode kernels directly with phase-specific global
+metadata; extend receives the exchanged K/V directly.
+Padding is excluded. Inverse all-to-all restores local tokens and base-TP heads before
 native O projection. Cache head ownership is `tp_rank * S + sp_rank`.
 
 After the model body, the shared SP forward gathers hidden states across SP and
@@ -62,7 +66,7 @@ reflected in the global view without changing scheduler tensors.
 
 ## Scope and tests
 
-Supported: native dense Qwen3, BF16, FlashAttention fa3/fa4, single-node
+Supported: native dense Qwen3, BF16, FlashAttention fa3/fa4 or Triton, single-node
 text generation with eager or breakable graph prefill and eager or full graph
 decode, uneven
 batches, chunked prefill and prefix reuse.
@@ -105,7 +109,7 @@ capture correctness. The communication smoke test is
 
 ## Breakable prefill CUDA graphs
 
-Use `--cuda-graph-backend-prefill breakable` with native BF16 Qwen3 and fa3/fa4.
+Use `--cuda-graph-backend-prefill breakable` with native BF16 Qwen3 and fa3/fa4 or triton.
 The transformer body is captured and returns local hidden states.
 `execute_prefill_sp_bcg` gathers them across SP after replay, then runs logits
 eagerly on the original global batch.
@@ -136,3 +140,8 @@ GPU comparison: `python test/manual/test_ulysses_prefill_graph.py --tp-size 2`
 reuse, compares tokens/logprobs with eager prefill and checks the prefill graph
 metric to detect silent fallback. CUDA/NCCL/FA correctness requires running this
 test on GPUs; CPU tests do not validate capture or replay.
+
+Triton SP boundary tests: `python -m pytest test/registered/unit/layers/attention/test_triton_sp.py`.
+These CPU tests mock kernels and collectives to check head layouts, cache write
+locations, disabled writes, deterministic prefill dispatch, and output buffer ownership.
+GPU numerical and graph replay validation is still required for Triton.

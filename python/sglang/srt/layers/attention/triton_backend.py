@@ -401,9 +401,9 @@ class TritonAttnBackend(AttentionBackend):
         # And the real_num_token is num_seq in decoding phase.
         num_group = num_token // num_seq
 
-        assert num_group * num_seq == num_token, (
-            f"num_seq({num_seq}), num_token({num_token}), something goes wrong!"
-        )
+        assert (
+            num_group * num_seq == num_token
+        ), f"num_seq({num_seq}), num_token({num_token}), something goes wrong!"
 
         if (
             self.static_kv_splits or self.device_core_count <= 0
@@ -1516,6 +1516,154 @@ class TritonAttnBackend(AttentionBackend):
                 layer, loc, k, v, k_scale, v_scale, **kwargs
             )
 
+    def _resolve_decode_lean_attention(
+        self, layer: RadixAttention, forward_batch: ForwardBatch
+    ) -> bool:
+        from sglang.srt.model_executor.runner_utils.capture_mode import (
+            get_is_capture_mode,
+        )
+
+        if envs.SGLANG_DISABLE_LEAN_ATTENTION.get():
+            return False
+
+        enable_lean = self.enable_lean_attention
+        if enable_lean is not None:
+            return enable_lean
+
+        kv_group_num = layer.tp_q_head_num // layer.tp_k_head_num
+        is_mla = layer.qk_head_dim != layer.v_head_dim
+        if get_is_capture_mode():
+            return self._lean_capture_policy(
+                layer.tp_q_head_num,
+                kv_group_num,
+                forward_batch.batch_size,
+                is_mla,
+            )
+        return self._lean_decode_seqlen_gate(
+            layer.tp_q_head_num,
+            kv_group_num,
+            forward_batch.batch_size,
+            forward_batch.seq_lens_sum,
+            is_mla,
+        )
+
+    def _forward_sp(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        save_kv_cache=True,
+        sinks=None,
+        score_mod=None,
+        aux_tensors=None,
+    ):
+        from sglang.srt.layers.sp.sp_strategy import SPKVWrite, get_sp_strategy
+
+        strategy = get_sp_strategy()
+        if any(value is not None for value in (sinks, score_mod, aux_tensors)):
+            raise ValueError("SP QKV redistribution requires dense attention inputs")
+        if (
+            self.use_mla
+            or self.dcp_size > 1
+            or layer.is_cross_attention
+            or layer.attn_type != AttentionType.DECODER
+            or (
+                layer.sliding_window_size is not None and layer.sliding_window_size > -1
+            )
+            or self.enable_deterministic
+        ):
+            raise ValueError("Ulysses requires dense causal attention with KV cache")
+
+        metadata = self.forward_metadata
+
+        def attention_kernel(q, k, v, layer):
+            output = q.new_empty((q.shape[0], layer.tp_q_head_num, layer.v_head_dim))
+            logits_soft_cap = logit_capping_mod(
+                layer.logit_capping_method, layer.logit_cap
+            )
+            if layer.k_scale is not None and layer.v_scale is not None:
+                k_descale = layer.k_scale_float
+                v_descale = layer.v_scale_float
+            else:
+                k_descale = 1.0
+                v_descale = 1.0
+
+            key_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+            value_cache = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
+            if forward_batch.forward_mode.is_decode():
+                self.decode_attention_fwd(
+                    q,
+                    key_cache,
+                    value_cache,
+                    output,
+                    metadata.kv_indptr,
+                    metadata.kv_indices,
+                    metadata.attn_logits,
+                    metadata.attn_lse,
+                    metadata.num_kv_splits,
+                    self.max_kv_splits,
+                    layer.scaling,
+                    k_descale,
+                    v_descale,
+                    logit_cap=logits_soft_cap,
+                    xai_temperature_len=layer.xai_temperature_len,
+                    has_mla=False,
+                    use_pdl=self.use_pdl,
+                    page_size=self.page_size,
+                    enable_lean=self._resolve_decode_lean_attention(
+                        layer, forward_batch
+                    ),
+                    lean_Mp=metadata.lean_Mp,
+                    lean_Lp=metadata.lean_Lp,
+                    lean_Op=metadata.lean_Op,
+                    lean_locks=metadata.lean_locks,
+                )
+                return output
+
+            self.extend_attention_fwd(
+                q,
+                k.contiguous(),
+                v.contiguous(),
+                output,
+                key_cache,
+                value_cache,
+                metadata.qo_indptr,
+                metadata.kv_indptr,
+                metadata.kv_indices,
+                metadata.custom_mask,
+                True,
+                metadata.mask_indptr,
+                metadata.max_extend_len,
+                k_descale,
+                v_descale,
+                layer.scaling,
+                logit_cap=logits_soft_cap,
+                xai_temperature_len=layer.xai_temperature_len,
+                page_size=self.page_size,
+                extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+            )
+            return output
+
+        return strategy.forward_attention(
+            q,
+            k,
+            v,
+            layer,
+            forward_batch,
+            attention_kernel=attention_kernel,
+            kv_write=SPKVWrite(
+                pool=self.token_to_kv_pool,
+                location=KVWriteLoc(
+                    forward_batch.out_cache_loc,
+                    self.forward_metadata.swa_out_cache_loc,
+                    full_loc=self.forward_metadata.out_cache_loc_full_physical,
+                ),
+                enabled=save_kv_cache,
+            ),
+        )
+
     def forward_extend(
         self,
         q: torch.Tensor,
@@ -1528,6 +1676,19 @@ class TritonAttnBackend(AttentionBackend):
         score_mod=None,
         aux_tensors=None,
     ):
+        if getattr(forward_batch, "sp_metadata", None) is not None:
+            return self._forward_sp(
+                q,
+                k,
+                v,
+                layer,
+                forward_batch,
+                save_kv_cache,
+                sinks,
+                score_mod,
+                aux_tensors,
+            )
+
         if (
             k is not None
             and v is not None
@@ -2132,6 +2293,19 @@ class TritonAttnBackend(AttentionBackend):
         # output value to have a 3D tensor shape. This reshapes the output correctly.
         q = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
 
+        if getattr(forward_batch, "sp_metadata", None) is not None:
+            return self._forward_sp(
+                q,
+                k,
+                v,
+                layer,
+                forward_batch,
+                save_kv_cache,
+                sinks,
+                score_mod,
+                aux_tensors,
+            )
+
         # TODO: reuse the buffer across layers
         if layer.qk_head_dim != layer.v_head_dim:
             o = q.new_empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
@@ -2207,33 +2381,7 @@ class TritonAttnBackend(AttentionBackend):
         # grid still adapts to raggedness on-device at replay. In eager decode, real seq_lens
         # are known, so lean_decode_seqlen_gate uses them. An explicit True/False override is
         # respected; the SGLANG_DISABLE_LEAN_ATTENTION kill-switch forces the standard kernel.
-        from sglang.srt.environ import envs
-        from sglang.srt.model_executor.runner_utils.capture_mode import (
-            get_is_capture_mode,
-        )
-
-        if envs.SGLANG_DISABLE_LEAN_ATTENTION.get():
-            enable_lean = False
-        else:
-            enable_lean = self.enable_lean_attention
-            if enable_lean is None:
-                kv_group_num = layer.tp_q_head_num // layer.tp_k_head_num
-                is_mla = layer.qk_head_dim != layer.v_head_dim
-                if get_is_capture_mode():
-                    enable_lean = self._lean_capture_policy(
-                        layer.tp_q_head_num,
-                        kv_group_num,
-                        forward_batch.batch_size,
-                        is_mla,
-                    )
-                else:
-                    enable_lean = self._lean_decode_seqlen_gate(
-                        layer.tp_q_head_num,
-                        kv_group_num,
-                        forward_batch.batch_size,
-                        forward_batch.seq_lens_sum,
-                        is_mla,
-                    )
+        enable_lean = self._resolve_decode_lean_attention(layer, forward_batch)
 
         if self.dcp_size > 1:
             if score_mod is not None:

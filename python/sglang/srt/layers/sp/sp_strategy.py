@@ -208,7 +208,7 @@ class UlyssesParallelStrategy:
     ):
         """Exchange QKV, write global KV, call the kernel and restore local tokens.
 
-        attention_kernel binds backend-specific options and accepts only q.
+        attention_kernel accepts redistributed q/k/v and the attention head layout.
         kv_write describes where to store the exchanged K/V before attention.
         """
         if k is None or v is None:
@@ -242,6 +242,9 @@ class UlyssesParallelStrategy:
                 )
             output = attention_kernel(
                 q=q.view(-1, attention.tp_q_head_num, attention.qk_head_dim),
+                k=k,
+                v=v,
+                layer=attention,
             )
         return exchange_attention_output(
             output, metadata=metadata, group=get_parallel().ulysses_sp_group
