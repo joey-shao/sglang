@@ -1,8 +1,9 @@
-# Fixed Ulysses SP × TP for Qwen3
+# Ulysses SP × TP and shift parallel for Qwen3
 
 Each worker loads one model sharded over a TP subgroup and replicated across
-SP. The entire model processes a local token shard. There is no Shift mode,
-second model, or per-layer model wrapper.
+SP. The entire model processes a local token shard. With shift parallel
+enabled, each worker also loads a full-TP model and selects one of the two
+weight layouts at the model-forward boundary.
 
 ## Launch
 
@@ -15,6 +16,22 @@ python -m sglang.launch_server \
 ```
 
 Select `--attention-backend triton` to use the Triton backend instead.
+
+Enable shift parallel and choose its token threshold with:
+
+```bash
+python -m sglang.launch_server \
+  --model-path Qwen/Qwen3-8B --dtype bfloat16 \
+  --tp-size 4 --ulysses-sp-size 2 \
+  --enable-shift-parallel --shift-parallel-threshold 512 \
+  --attention-backend fa3 \
+  --cuda-graph-backend-prefill breakable --cuda-graph-backend-decode full
+```
+
+An unpadded forward with at most 512 input tokens uses the full-TP model; a
+larger forward uses the Ulysses SP model. Prefill therefore switches on its
+token count, while ordinary one-token decode switches on batch size. The
+threshold is inclusive on the TP side.
 
 P=`tp_size` is the total worker count and scheduler communication width.
 S=`ulysses_sp_size` divides P, and T=P/S is the model TP width. Embedding,
@@ -41,6 +58,11 @@ The worker executes ModelRunner inside the model TP subgroup scope, restoring
 the full scheduling group on exit, including exceptions. Hidden states stay local through every layer;
 embedding, output projection and MLP collectives never combine different SP
 token shards. All model weights are constructed/loaded under the same subgroup.
+
+Shift parallel retains two independent Qwen3 instances. The TP instance is
+constructed and loaded over the full scheduling TP group. The SP instance is
+constructed and loaded over the model-TP subgroup. The selected instance and
+parallel scope are changed together for eager execution and CUDA graph replay.
 
 ## Attention and output
 
@@ -107,6 +129,10 @@ capture correctness. The communication smoke test is
 `torchrun --standalone --nproc-per-node=2 test/manual/test_ulysses_decode_graph.py`
 (and can also run with 4 ranks).
 
+When shift parallel is enabled, every configured decode bucket is captured
+twice. `ShapeKey.shift_type` distinguishes the `tp` and `sp` graphs even when
+their batch size and other variants are identical.
+
 ## Breakable prefill CUDA graphs
 
 Use `--cuda-graph-backend-prefill breakable` with native BF16 Qwen3 and fa3/fa4 or triton.
@@ -133,6 +159,10 @@ zero-pads back to the fixed local width, including ranks with no real tokens.
 This allows uneven multi-request batches and cached/chunked prefills to reuse
 the same graph without freezing request boundaries. The gathered body output
 is trimmed to N before logits.
+
+Shift parallel likewise captures each prefill token bucket once for `tp` and
+once for `sp`. Captured attention metadata and chunked-prefix variants use the
+complete shape key, so equal token buckets from the two layouts do not alias.
 
 CPU layout/boundary tests: `python test/registered/unit/layers/test_sp_prefill_graph.py`.
 GPU comparison: `python test/manual/test_ulysses_prefill_graph.py --tp-size 2`

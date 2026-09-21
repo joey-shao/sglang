@@ -82,7 +82,13 @@ from sglang.srt.layers.cp.utils import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import create_sampler
-from sglang.srt.layers.sp.sp_strategy import get_sp_strategy
+from sglang.srt.layers.sp.sp_strategy import (
+    SHIFT_SP,
+    SHIFT_TP,
+    get_sp_strategy,
+    resolve_shift_parallel_type,
+    shift_parallel_type_scope,
+)
 from sglang.srt.lora.lora_manager import LoRAManager, init_lora_cuda_graph_moe_buffers
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.schedule_batch import sanity_check_mm_pad_shift_value
@@ -1200,6 +1206,7 @@ class ModelRunner:
 
             if get_parallel().ulysses_sp_size > 1:
                 from sglang.srt.model_executor.model_runner_components.ulysses_weight_load import (
+                    load_shift_parallel_models,
                     load_ulysses_model,
                 )
                 from sglang.srt.model_loader.utils import get_model_architecture
@@ -1213,22 +1220,42 @@ class ModelRunner:
                     raise ValueError(
                         "Ulysses requires the native SGLang Qwen3ForCausalLM implementation"
                     )
-                loaded = load_ulysses_model(
-                    model_config=self.model_config,
-                    load_config=self.load_config,
-                    load_one=load_one,
-                )
-                logger.info(
-                    "Loaded one Qwen3 model for Ulysses: workers=%s, model TP=%s, SP=%s. "
-                    "Fixed SP execution enabled.",
-                    self.ps.tp_size,
-                    get_parallel().ulysses_model_tp_group.world_size,
-                    get_parallel().ulysses_sp_size,
-                )
+                if get_parallel().enable_shift_parallel:
+                    tp_loaded, loaded = load_shift_parallel_models(
+                        model_config=self.model_config,
+                        load_config=self.load_config,
+                        load_one=load_one,
+                    )
+                    self.tp_model = tp_loaded.model
+                    self.sp_model = loaded.model
+                    logger.info(
+                        "Loaded Qwen3 TP and SP models for shift parallel: "
+                        "workers=%s, model TP=%s, SP=%s, threshold=%s.",
+                        self.ps.tp_size,
+                        get_parallel().ulysses_model_tp_group.world_size,
+                        get_parallel().ulysses_sp_size,
+                        get_parallel().shift_parallel_threshold,
+                    )
+                else:
+                    loaded = load_ulysses_model(
+                        model_config=self.model_config,
+                        load_config=self.load_config,
+                        load_one=load_one,
+                    )
+                    self.tp_model = None
+                    self.sp_model = loaded.model
+                    logger.info(
+                        "Loaded one Qwen3 model for Ulysses: workers=%s, model TP=%s, SP=%s. "
+                        "Fixed SP execution enabled.",
+                        self.ps.tp_size,
+                        get_parallel().ulysses_model_tp_group.world_size,
+                        get_parallel().ulysses_sp_size,
+                    )
             else:
                 loaded = load_one(
                     model_config=self.model_config, load_config=self.load_config
                 )
+                self.tp_model = self.sp_model = None
         self.loader = loaded.loader
         self.model = loaded.model
         self.startup_weight_load = loaded.startup_weight_load
@@ -1245,16 +1272,18 @@ class ModelRunner:
         # Register model for layerwise NVTX profiling if enabled
         if get_exec().comm.enable_layerwise_nvtx_marker:
             pyt_hooks = PytHooks()
-            pyt_hooks.register_hooks(self.model, module_prefix="model")
+            for model in self._weight_models():
+                pyt_hooks.register_hooks(model, module_prefix="model")
 
         # Same leaf `configure_kv_cache_dtype` reads: the bag, not the startup
         # record, so the FP8 gate and the pool cannot disagree after an
         # override. (The runner's own stamp is not set yet -- load_model runs
         # before configure_kv_cache_dtype.)
-        load_kv_cache_scales(
-            model=self.model,
-            kv_cache_dtype=get_model().kv_cache_dtype,
-        )
+        for model in self._weight_models():
+            load_kv_cache_scales(
+                model=model,
+                kv_cache_dtype=get_model().kv_cache_dtype,
+            )
 
         self.sliding_window_size = resolve_sliding_window_size(
             self.model, self.model_config
@@ -1284,29 +1313,31 @@ class ModelRunner:
                 f"mem usage={self.weight_load_mem_usage:.2f} GB."
             )
 
-        report_online_quantization(
-            model=self.model,
-        )
+        for model in self._weight_models():
+            report_online_quantization(model=model)
 
-        maybe_register_debug_tensor_dump_hook(
-            model=self.model,
-            spec_algorithm=self.spec_algorithm,
-            is_draft_worker=self.is_draft_worker,
-            tp_size=self.ps.tp_size,
-            tp_rank=self.ps.tp_rank,
-            pp_rank=self.ps.pp_rank,
-        )
+        for model in self._weight_models():
+            maybe_register_debug_tensor_dump_hook(
+                model=model,
+                spec_algorithm=self.spec_algorithm,
+                is_draft_worker=self.is_draft_worker,
+                tp_size=self.ps.tp_size,
+                tp_rank=self.ps.tp_rank,
+                pp_rank=self.ps.pp_rank,
+            )
 
         if dumper.may_enable:
             dumper.apply_source_patches()
-            dumper.register_non_intrusive_dumper(self.model)
+            for model in self._weight_models():
+                dumper.register_non_intrusive_dumper(model)
 
         # Pre-expand RoPE cache before CUDA Graph capture
-        reserve_rope_cache_for_long_sequences(
-            self.model,
-            self.model_config,
-            logger,
-        )
+        for model in self._weight_models():
+            reserve_rope_cache_for_long_sequences(
+                model,
+                self.model_config,
+                logger,
+            )
 
         if self.startup_weight_load is None:
             dist_barrier_after_load(
@@ -1339,8 +1370,24 @@ class ModelRunner:
         )
         self.startup_weight_load = None
 
+    def _weight_models(self) -> tuple[torch.nn.Module, ...]:
+        """Return each independently loaded weight layout exactly once."""
+        candidates = (
+            getattr(self, "tp_model", None),
+            getattr(self, "sp_model", None),
+            self.model,
+        )
+        models = []
+        seen = set()
+        for model in candidates:
+            if model is not None and id(model) not in seen:
+                models.append(model)
+                seen.add(id(model))
+        return tuple(models)
+
     def maybe_precompile_model_kernels_after_loading(self) -> None:
-        maybe_precompile_model_kernels_after_loading(self.model, self.device)
+        for model in self._weight_models():
+            maybe_precompile_model_kernels_after_loading(model, self.device)
 
     def maybe_init_dwdp(self):
         if self.is_draft_worker:
@@ -1738,6 +1785,42 @@ class ModelRunner:
 
         return output
 
+    @contextlib.contextmanager
+    def shift_parallel_model_scope(self, shift_type: Optional[str]):
+        """Select the weight layout matching the current shift mode."""
+        if not get_parallel().enable_shift_parallel:
+            yield
+            return
+        if shift_type == SHIFT_TP:
+            selected = self.tp_model
+        elif shift_type == SHIFT_SP:
+            selected = self.sp_model
+        else:
+            raise ValueError(f"Shift parallel mode is not selected: {shift_type!r}")
+        if selected is None:
+            raise RuntimeError(f"Shift parallel {shift_type} model is not loaded")
+        original = self.model
+        self.model = selected
+        try:
+            yield
+        finally:
+            self.model = original
+
+    @contextlib.contextmanager
+    def shift_parallel_execution_scope(self, shift_type: Optional[str]):
+        """Select the model first, then derive its tensor-parallel scope."""
+        with (
+            shift_parallel_type_scope(shift_type),
+            self.shift_parallel_model_scope(shift_type),
+        ):
+            model_tp_ctx = (
+                ulysses_model_tp_scope()
+                if get_sp_strategy() is not None
+                else contextlib.nullcontext()
+            )
+            with model_tp_ctx:
+                yield
+
     def _maybe_execute_deferred_mamba_cow_and_clear(
         self, forward_batch: ForwardBatch
     ) -> None:
@@ -1798,13 +1881,15 @@ class ModelRunner:
         else:
             ctx_mgr = forward_context(ForwardContext(attn_backend=self.attn_backend))
 
-        model_tp_ctx = (
-            ulysses_model_tp_scope()
-            if get_sp_strategy() is not None
-            else contextlib.nullcontext()
-        )
+        # Choose from the live, unpadded workload. CUDA graph padding may map
+        # both sides of the threshold to the same bucket; shift_type in the
+        # graph key keeps those captures distinct.
+        shift_type = resolve_shift_parallel_type(forward_batch.input_ids.numel())
 
-        with model_tp_ctx, ctx_mgr:
+        with (
+            self.shift_parallel_execution_scope(shift_type),
+            ctx_mgr,
+        ):
             mode_check = (
                 forward_batch.forward_mode.is_cpu_graph
                 if self.device == "cpu"

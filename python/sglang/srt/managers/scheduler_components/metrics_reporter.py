@@ -701,6 +701,17 @@ class SchedulerMetricsReporter:
                 f"waiting-image-req: {len(self.scheduler.mm_receiver.waiting_list)}, "
             )
 
+        if get_parallel().enable_shift_parallel:
+            num_tokens = (
+                batch.extend_num_tokens
+                if batch is not None and batch.extend_num_tokens is not None
+                else prefill_stats.log_input_tokens
+            )
+            parallel_type = (
+                "tp" if num_tokens <= get_parallel().shift_parallel_threshold else "sp"
+            )
+            msg += f"parallel type: {parallel_type}, "
+
         msg += f"{self._graph_backend_label}: {can_run_cuda_graph}, "
         msg += f"input throughput (token/s): {self.last_input_throughput:.2f}"
 
@@ -955,6 +966,14 @@ class SchedulerMetricsReporter:
             msg += (
                 f"waiting-image-req: {len(self.scheduler.mm_receiver.waiting_list)}, "
             )
+
+        if get_parallel().enable_shift_parallel:
+            parallel_type = (
+                "tp"
+                if batch.batch_size() <= get_parallel().shift_parallel_threshold
+                else "sp"
+            )
+            msg += f"parallel type: {parallel_type}, "
 
         msg += (
             f"{self._graph_backend_label}: {can_run_cuda_graph}, "

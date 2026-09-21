@@ -33,9 +33,12 @@ class ShapeKey:
     dsa_variant: DSA decode dual-graph variant ("dense" / "sparse"), or None
         when DSA dual-graph capture is not enabled. Composes with variant_label
         so LoRA and DSA variants can be captured independently.
+    shift_type: shift-parallel execution mode ("tp" / "sp"), or None when
+        shift parallel is disabled.
     """
 
     size: int
     stream_idx: Optional[int] = None
     variant_label: Optional[str] = None
     dsa_variant: Optional[str] = None
+    shift_type: Optional[str] = None

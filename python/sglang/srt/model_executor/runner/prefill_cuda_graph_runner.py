@@ -78,7 +78,10 @@ from sglang.srt.layers.pooler import EmbeddingPoolerOutput
 from sglang.srt.layers.sp.sp_strategy import (
     PrefillSPBCGInput,
     execute_prefill_sp_bcg,
+    get_shift_parallel_type,
     get_sp_strategy,
+    shift_parallel_capture_types,
+    shift_parallel_type_scope,
 )
 from sglang.srt.model_executor.cuda_graph_buffer_registry import (
     CudaGraphBufferRegistry,
@@ -557,7 +560,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             self.use_captured_attn_metadata = model_runner.attn_backend.use_captured_forward_metadata_for_breakable_cuda_graph
         else:
             self.use_captured_attn_metadata = False
-        self.attn_metadata_buffers: Optional[Dict[int, object]] = (
+        self.attn_metadata_buffers: Optional[Dict[ShapeKey, object]] = (
             {} if self.use_captured_attn_metadata else None
         )
 
@@ -942,7 +945,31 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     "prefix batch has no captured FullCG variant"
                 )
                 variant = _chunked_prefix_variant(captured_n)
-        return ShapeKey(size=num_tokens, variant_label=variant)
+        return ShapeKey(
+            size=num_tokens,
+            variant_label=variant,
+            shift_type=get_shift_parallel_type(),
+        )
+
+    def _select_shift_parallel_model_state(self) -> None:
+        """Point runner-local layer caches at the currently selected model."""
+        if get_shift_parallel_type() is None:
+            return
+        self.layer_model = _resolve_transformer_layer_model(self.model_runner.model)
+        (
+            self.attention_layers,
+            self.moe_layers,
+            self.moe_fusions,
+            self.dsa_indexers,
+            self.mha_companion_layers,
+        ) = self.model_runner.get_cuda_graph_layers(self.layer_model)
+        self.has_mha_companion_layers = any(
+            layer is not None for layer in self.mha_companion_layers
+        )
+        params = list(inspect.signature(self.layer_model.forward).parameters)
+        self._input_embeds_arg_idx = (
+            params.index("input_embeds") if "input_embeds" in params else None
+        )
 
     def _create_chunked_prefix_buffers(self) -> _ChunkedPrefixCaptureBuffers:
         """Allocate the stable chunk-metadata tensors shared by all variants."""
@@ -1078,7 +1105,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         )
 
     def _init_forward_metadata_for_capture(
-        self, forward_batch: ForwardBatch, num_tokens: int
+        self, forward_batch: ForwardBatch, shape_key: ShapeKey
     ) -> None:
         """Capture-time metadata init for the BCG-with-captured-metadata
         contract. For opt-in backends (DSV4), call the BCG-specific entry
@@ -1095,13 +1122,15 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 )
             )
             assert self.attn_metadata_buffers is not None
-            self.attn_metadata_buffers[num_tokens] = metadata
+            self.attn_metadata_buffers[shape_key] = metadata
 
     def _prepare_forward_metadata_for_replay(
         self,
         forward_batch: ForwardBatch,
         static_forward_batch: ForwardBatch,
-        num_tokens: int,
+        shape_key: Optional[ShapeKey] = None,
+        *,
+        num_tokens: Optional[int] = None,
     ) -> None:
         """Replay-time metadata refresh for the BCG-with-captured-metadata
         contract. For opt-in backends, refresh the stashed per-bucket
@@ -1110,6 +1139,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         capture-stable wrapper state planned at capture time with the
         real seq_lens / prefix_lens; the captured kernels read the
         updated state at replay."""
+        if shape_key is None:
+            assert num_tokens is not None
+            shape_key = ShapeKey(
+                size=num_tokens,
+                shift_type=get_shift_parallel_type(),
+            )
         attn_backend = self.model_runner.attn_backend
         if self._is_full_backend:
             # Slot-padded shallow view: plan() must see exactly req_slots
@@ -1132,11 +1167,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         if not self.use_captured_attn_metadata:
             attn_backend.init_forward_metadata(forward_batch)
             attn_backend.prepare_prefill_shared_read_snapshot(
-                forward_batch, num_qo_tokens=num_tokens
+                forward_batch, num_qo_tokens=shape_key.size
             )
             return
         assert self.attn_metadata_buffers is not None
-        metadata = self.attn_metadata_buffers[num_tokens]
+        metadata = self.attn_metadata_buffers[shape_key]
         attn_backend.prepare_forward_metadata_for_breakable_cuda_graph_replay(
             metadata,
             forward_batch,
@@ -1459,10 +1494,18 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 capture_range.set_description(
                     f"Capturing num tokens ({num_tokens=} {avail_mem=:.2f} GB)"
                 )
-            self.capture_one_shape(num_tokens)
-            if self._capture_chunked_prefix:
-                for captured_n in self._prefix_capture_variants:
-                    self.capture_one_shape(num_tokens, prefix_num_chunks=captured_n)
+            for shift_type in shift_parallel_capture_types():
+                with (
+                    shift_parallel_type_scope(shift_type),
+                    self.model_runner.shift_parallel_model_scope(shift_type),
+                ):
+                    self._select_shift_parallel_model_state()
+                    self.capture_one_shape(num_tokens)
+                    if self._capture_chunked_prefix:
+                        for captured_n in self._prefix_capture_variants:
+                            self.capture_one_shape(
+                                num_tokens, prefix_num_chunks=captured_n
+                            )
 
     def capture_one_shape(self, size: int, *, prefix_num_chunks: int = 0) -> None:
         """Per-shape capture: build dummy ForwardBatch + run_once,
@@ -1495,6 +1538,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 if prefix_num_chunks
                 else None
             ),
+            shift_type=get_shift_parallel_type(),
         )
         if prefix_num_chunks:
             self._prepare_chunked_prefix_capture(
@@ -1510,15 +1554,16 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             # Reaching into a backend-specific metadata cache here would make
             # this path incompatible with the OSS FlashAttention backend.
         else:
-            self._init_forward_metadata_for_capture(forward_batch, num_tokens)
+            self._init_forward_metadata_for_capture(forward_batch, shape_key)
 
         if get_sp_strategy() is not None:
             # Plan attention against global inputs before replacing the model
             # input views with local SP buffers, just as replay preparation does.
             assert self.prefill_sp_bcg_input is not None
-            self.prefill_sp_bcg_input.prepare(
-                self, forward_batch, static_num_tokens=num_tokens, capture=True
-            )
+            with ulysses_model_tp_scope():
+                self.prefill_sp_bcg_input.prepare(
+                    self, forward_batch, static_num_tokens=num_tokens, capture=True
+                )
 
         def run_once():
             return self._run_forward(forward_batch, num_tokens)
@@ -1781,7 +1826,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             metadata_forward_batch = static_forward_batch
 
         self._prepare_forward_metadata_for_replay(
-            metadata_forward_batch, static_forward_batch, static_num_tokens
+            metadata_forward_batch,
+            static_forward_batch,
+            self._shape_key(static_num_tokens, forward_batch),
         )
 
         if get_sp_strategy() is not None:
@@ -1878,7 +1925,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             raw_num_tokens=raw_num_tokens,
         ):
             return self.backend.replay(
-                ShapeKey(size=static_num_tokens),
+                ShapeKey(
+                    size=static_num_tokens,
+                    shift_type=get_shift_parallel_type(),
+                ),
                 static_forward_batch,
                 **kwargs,
             )
@@ -1934,6 +1984,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self, forward_batch: ForwardBatch, **kwargs
     ) -> Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput]:
         self._validate_capture_hidden_mode(forward_batch)
+        self._select_shift_parallel_model_state()
         with self.backend.replay_session():
             static_forward_batch = self.load_batch(forward_batch, **kwargs)
             sp_metadata = getattr(static_forward_batch, "sp_metadata", None)

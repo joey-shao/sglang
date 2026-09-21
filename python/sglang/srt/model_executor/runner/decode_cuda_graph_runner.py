@@ -57,7 +57,13 @@ from sglang.srt.layers.dp_attention import (
     set_is_extend_in_batch,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.layers.sp.sp_strategy import get_sp_strategy, sp_model_forward
+from sglang.srt.layers.sp.sp_strategy import (
+    get_shift_parallel_type,
+    get_sp_strategy,
+    shift_parallel_capture_types,
+    shift_parallel_type_scope,
+    sp_model_forward,
+)
 from sglang.srt.model_executor.cuda_graph_buffer_registry import (
     CudaGraphBufferRegistry,
     build_decode_registry,
@@ -573,6 +579,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             stream_idx=stream_idx,
             variant_label=variant_label,
             dsa_variant=dsa_variant,
+            shift_type=get_shift_parallel_type(),
         )
 
     def _capture_graph_size(self, *, bs: int, num_tokens: int) -> int:
@@ -1133,24 +1140,33 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     f"Capturing batches ({bs=} {avail_mem=:.2f} GB)"
                 )
 
-            for variant_label, _variant_has_lora in lora_variants:
-                _set_capture_lora_variant(variant_label)
-                for dsa_variant in dsa_variants:
-                    _set_capture_dsa_variant(dsa_variant)
-                    with torch_compile_decoration.patch_model(
-                        self.model_runner.model,
-                        bs in self.compile_bs,
-                        num_tokens=bs * self.captured_req_width,
-                        tp_group=self.model_runner.tp_group,
-                    ) as forward:
-                        if dsa_variant is None:
-                            self.capture_one_shape(
-                                bs, forward, stream_idx, variant_label
-                            )
-                        else:
-                            self.capture_one_shape(
-                                bs, forward, stream_idx, variant_label, dsa_variant
-                            )
+            for shift_type in shift_parallel_capture_types():
+                with (
+                    shift_parallel_type_scope(shift_type),
+                    self.model_runner.shift_parallel_model_scope(shift_type),
+                ):
+                    for variant_label, _variant_has_lora in lora_variants:
+                        _set_capture_lora_variant(variant_label)
+                        for dsa_variant in dsa_variants:
+                            _set_capture_dsa_variant(dsa_variant)
+                            with torch_compile_decoration.patch_model(
+                                self.model_runner.model,
+                                bs in self.compile_bs,
+                                num_tokens=bs * self.captured_req_width,
+                                tp_group=self.model_runner.tp_group,
+                            ) as forward:
+                                if dsa_variant is None:
+                                    self.capture_one_shape(
+                                        bs, forward, stream_idx, variant_label
+                                    )
+                                else:
+                                    self.capture_one_shape(
+                                        bs,
+                                        forward,
+                                        stream_idx,
+                                        variant_label,
+                                        dsa_variant,
+                                    )
         _set_capture_dsa_variant(None)
 
     def capture_one_shape(

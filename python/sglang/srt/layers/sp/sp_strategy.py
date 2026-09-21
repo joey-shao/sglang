@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import copy
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Callable
 
@@ -104,16 +105,58 @@ def exchange_attention_output(output, *, metadata: SPBatchMetadata, group):
 
 
 _STRATEGY = None
+_SHIFT_TYPE: ContextVar[str | None] = ContextVar("shift_parallel_type", default=None)
+
+SHIFT_TP = "tp"
+SHIFT_SP = "sp"
 
 
-def get_sp_strategy():
-    """Resolve fixed SP x TP independently of prefill CP."""
+def shift_parallel_capture_types() -> tuple[str | None, ...]:
+    if not getattr(get_parallel(), "enable_shift_parallel", False):
+        return (None,)
+    return (SHIFT_TP, SHIFT_SP)
+
+
+def resolve_shift_parallel_type(num_tokens: int) -> str | None:
+    """Choose the model layout for one unpadded runtime/capture shape."""
+    parallel = get_parallel()
+    if not getattr(parallel, "enable_shift_parallel", False):
+        return None
+    return SHIFT_TP if num_tokens <= parallel.shift_parallel_threshold else SHIFT_SP
+
+
+def get_shift_parallel_type() -> str | None:
+    return _SHIFT_TYPE.get()
+
+
+@contextmanager
+def shift_parallel_type_scope(shift_type: str | None):
+    if shift_type not in (None, SHIFT_TP, SHIFT_SP):
+        raise ValueError(f"Unknown shift parallel type: {shift_type!r}")
+    token = _SHIFT_TYPE.set(shift_type)
+    try:
+        yield
+    finally:
+        _SHIFT_TYPE.reset(token)
+
+
+def get_sp_strategy(num_tokens: int | None = None):
+    """Resolve SP for the current shift mode independently of prefill CP."""
     global _STRATEGY
-    size = get_parallel().ulysses_sp_size
+    parallel = get_parallel()
+    size = parallel.ulysses_sp_size
     if size <= 1:
         _STRATEGY = None
         return None
-    if _STRATEGY is None or _STRATEGY.sp_size != size:
+    if getattr(parallel, "enable_shift_parallel", False):
+        shift_type = (
+            resolve_shift_parallel_type(num_tokens)
+            if num_tokens is not None
+            else get_shift_parallel_type()
+        )
+        if shift_type == SHIFT_TP:
+            return None
+    if _STRATEGY is None:
         _STRATEGY = UlyssesParallelStrategy(sp_size=size)
     return _STRATEGY
 

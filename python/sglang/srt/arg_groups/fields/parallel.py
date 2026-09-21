@@ -60,6 +60,14 @@ class Parallel:
         int,
         "Ulysses sequence parallelism size. Divides --tp-size (the total worker count); the entire model uses TP subgroups of tp_size / ulysses_sp_size ranks, with token shards across SP. Requires FlashAttention (fa3/fa4) or Triton attention, eager or breakable CUDA graph prefill, and eager or full CUDA graph decode. Supports ordinary overlap scheduling; two-batch overlap is unsupported. Cannot be combined with attention context parallelism, decode context parallelism, or DP attention.",
     ] = 1
+    enable_shift_parallel: A[
+        bool,
+        "Enable runtime switching between full tensor parallelism and Ulysses sequence parallelism. Shapes at or below --shift-parallel-threshold use TP; larger shapes use SP. Requires --ulysses-sp-size greater than one.",
+    ] = False
+    shift_parallel_threshold: A[
+        int,
+        "Maximum prefill token count or decode batch size that uses full TP when --enable-shift-parallel is set.",
+    ] = 512
     dcp_size: A[
         int,
         Arg(

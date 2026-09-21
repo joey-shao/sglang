@@ -29,6 +29,30 @@ def check_server_args(server_args: Any):
 
     cfg = resolving_view(server_args)
 
+    if cfg.ulysses_sp_size > 1:
+        if cfg.attn_cp_size > 1:
+            raise ValueError(
+                "Ulysses parallel cannot be combined with attention context parallel"
+            )
+        if cfg.dcp_size > 1:
+            raise ValueError(
+                "Ulysses parallel cannot be combined with decode context parallel"
+            )
+        if cfg.enable_dp_attention:
+            raise ValueError("Ulysses parallel cannot be combined with DP attention")
+
+    if cfg.enable_shift_parallel:
+        if cfg.ulysses_sp_size <= 1:
+            raise ValueError(
+                "--enable-shift-parallel requires --ulysses-sp-size greater than one"
+            )
+        if cfg.shift_parallel_threshold < 1:
+            raise ValueError("--shift-parallel-threshold must be positive")
+        if cfg.startup_weight_load_mode != "serial":
+            raise ValueError(
+                "Shift parallel currently requires --startup-weight-load-mode=serial"
+            )
+
     # Check parallel size constraints
     if cfg.ep_join_mode != "scale":
         assert (cfg.tp_size * cfg.pp_size) % cfg.nnodes == 0, (
