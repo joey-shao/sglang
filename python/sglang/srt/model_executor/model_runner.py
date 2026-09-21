@@ -37,6 +37,7 @@ from sglang.srt.distributed import bootstrap
 from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
     maybe_init_shared_mooncake_transfer_engine,
 )
+from sglang.srt.distributed.parallel_state import ulysses_model_tp_scope
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.elastic_ep.elastic_ep import (
@@ -81,6 +82,7 @@ from sglang.srt.layers.cp.utils import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import create_sampler
+from sglang.srt.layers.sp.sp_strategy import get_sp_strategy
 from sglang.srt.lora.lora_manager import LoRAManager, init_lora_cuda_graph_moe_buffers
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.schedule_batch import sanity_check_mm_pad_shift_value
@@ -1795,7 +1797,14 @@ class ModelRunner:
             ctx_mgr = contextlib.nullcontext()
         else:
             ctx_mgr = forward_context(ForwardContext(attn_backend=self.attn_backend))
-        with ctx_mgr:
+
+        model_tp_ctx = (
+            ulysses_model_tp_scope()
+            if get_sp_strategy() is not None
+            else contextlib.nullcontext()
+        )
+
+        with model_tp_ctx, ctx_mgr:
             mode_check = (
                 forward_batch.forward_mode.is_cpu_graph
                 if self.device == "cpu"

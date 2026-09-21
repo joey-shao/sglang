@@ -1278,8 +1278,7 @@ class FlashAttentionBackend(AttentionBackend):
             or layer.is_cross_attention
             or layer.attn_type != AttentionType.DECODER
             or (
-                layer.sliding_window_size is not None
-                and layer.sliding_window_size > -1
+                layer.sliding_window_size is not None and layer.sliding_window_size > -1
             )
         ):
             raise ValueError("Ulysses requires dense causal attention with KV cache")
