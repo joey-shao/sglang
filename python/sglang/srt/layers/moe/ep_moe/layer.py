@@ -103,7 +103,9 @@ class DeepEPMoE(FusedMoE):
             and quant_config is not None
             and quant_config.get_name() == "humming"
         )
-        if get_moe_a2a_backend().is_deepep_v2():
+        if self.enable_expert_group_overlap:
+            self.deprecate_flag = True
+        elif get_moe_a2a_backend().is_deepep_v2():
             self.deprecate_flag = True
         elif is_humming:
             self.deprecate_flag = True
