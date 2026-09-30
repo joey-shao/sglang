@@ -1318,6 +1318,8 @@ def ep_scatter_from_psum(
         output_index,
         output_index.stride(0),
         output_index.stride(1),
+        expert_start=0,  # DeepEP dispatch returns rank-local expert IDs.
+        num_experts=num_experts,
         topk_num=recv_topk.shape[1],
         num_warps=num_warps,
         HIDDEN_SIZE=hidden_size,
