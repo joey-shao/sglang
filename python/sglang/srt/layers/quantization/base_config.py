@@ -136,6 +136,24 @@ class FusedMoEMethodBase(QuantizeMethodBase):
             f"{type(self).__name__} does not expose quant info for {runner_backend.value!r}"
         )
 
+    def get_expert_group_quant_info(
+        self,
+        layer: torch.nn.Module,
+        runner_backend: MoeRunnerBackendLike,
+        *,
+        expert_slice: slice,
+    ) -> MoeQuantInfo:
+        """Return quantization info for a contiguous group of local experts.
+
+        Resolve weights from the current layer tensors. Implementations must
+        slice expert-indexed weights and scales consistently; unsupported
+        methods must not fall back to quantization info for all experts.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not expose expert-group quant info "
+            f"for {runner_backend.value!r}"
+        )
+
 
 class QuantizationConfig(ABC):
     """Base class for quantization configs."""

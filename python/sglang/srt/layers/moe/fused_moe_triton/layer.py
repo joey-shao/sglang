@@ -29,6 +29,7 @@ from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
     get_moe_runner_backend,
 )
+from sglang.srt.layers.moe.expert_group_overlap import ExpertGroupExecutor
 from sglang.srt.layers.moe.kt_ep_wrapper import (
     KTEPWrapperMethod,
     create_kt_config_from_server_args,
@@ -157,7 +158,9 @@ def _get_deepep_comm_group(a2a_backend):
     return group
 
 
-def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
+def create_moe_dispatcher(
+    moe_runner_config: MoeRunnerConfig, expert_group_index=None
+) -> BaseDispatcher:
     a2a_backend = get_moe_a2a_backend()
     if a2a_backend.is_none() and is_npu():
         return AscendTPDispatcher(moe_runner_config)
@@ -193,6 +196,38 @@ def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
             return_recv_hook=True,
         )
     elif a2a_backend.is_deepep_v2():
+        if expert_group_index is not None:
+            from sglang.srt.layers.moe.token_dispatcher.deepep_v2 import DeepEPv2Buffer
+
+            # Matching layers reuse storage after the forward join. Each group and
+            # geometry owns a separate ElasticBuffer while dispatches are in flight.
+            group = get_tp_group().device_group
+            key = (
+                group,
+                expert_group_index,
+                moe_runner_config.hidden_size,
+                moe_runner_config.top_k,
+                moe_runner_config.num_experts,
+                moe_runner_config.num_local_experts,
+                moe_runner_config.params_dtype,
+            )
+            pool = type(
+                "ExpertGroupDeepEPv2Buffer",
+                (DeepEPv2Buffer,),
+                {
+                    "_STATE_KEY": ("expert_group_deepep_v2", key),
+                    "_PREFER_OVERLAP_WITH_COMPUTE": True,
+                },
+            )
+            return DeepEPv2Dispatcher(
+                group=group,
+                router_topk=moe_runner_config.top_k,
+                num_experts=moe_runner_config.num_experts,
+                num_local_experts=moe_runner_config.num_local_experts,
+                hidden_size=moe_runner_config.hidden_size,
+                params_dtype=moe_runner_config.params_dtype,
+                buffer_pool=pool,
+            )
         return DeepEPv2Dispatcher(
             group=get_tp_group().device_group,
             router_topk=moe_runner_config.top_k,
@@ -499,7 +534,26 @@ class FusedMoE(torch.nn.Module):
         )
 
         self.quant_method.create_moe_runner(self, self.moe_runner_config)
-        self.dispatcher = create_moe_dispatcher(self.moe_runner_config)
+
+        self.enable_expert_group_overlap = (
+            get_exec().moe.enable_moe_expert_group_overlap
+        )
+        self.expert_group_executor = None
+
+        if self.enable_expert_group_overlap:
+            self.expert_group_executor = ExpertGroupExecutor(
+                self.moe_runner_config,
+                self.quant_method.runner.runner_backend,
+                num_experts=self._num_global_routed,
+                num_local_experts=self._num_local_routed,
+                ep_size=self.moe_ep_size,
+                group_count=get_exec().moe.moe_expert_group_count,
+                dispatcher_factory=create_moe_dispatcher,
+            )
+            # Quantization setup accesses the same dispatcher through the layer.
+            self.dispatcher = self.expert_group_executor.dispatcher
+        else:
+            self.dispatcher = create_moe_dispatcher(self.moe_runner_config)
         # Dispatchers are not nn.Modules, so they cannot register their own
         # buffers; the AITER expert mask would not survive a memory-saver resume.
         expert_mask = getattr(self.dispatcher, "expert_mask_gpu", None)
@@ -1528,6 +1582,18 @@ class FusedMoE(torch.nn.Module):
         topk_output: TopKOutput,
         pre_quant_input: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ):
+        if self.enable_expert_group_overlap:
+            return self._forward_expert_groups(hidden_states, topk_output)
+        return self._forward_impl_normal(
+            hidden_states, topk_output, pre_quant_input=pre_quant_input
+        )
+
+    def _forward_impl_normal(
+        self,
+        hidden_states: torch.Tensor,
+        topk_output: TopKOutput,
+        pre_quant_input: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    ):
         origin_hidden_states_dim = hidden_states.shape[-1]
         assert self.quant_method is not None
 
@@ -1567,6 +1633,39 @@ class FusedMoE(torch.nn.Module):
             final_hidden_states = final_hidden_states[
                 ..., :origin_hidden_states_dim
             ].contiguous()
+
+        if self.reduce_results and (self.moe_tp_size > 1 or self.moe_ep_size > 1):
+            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+
+        return final_hidden_states
+
+    def _forward_expert_groups(
+        self,
+        hidden_states: torch.Tensor,
+        topk_output: StandardTopKOutput,
+    ) -> torch.Tensor:
+        """Execute the two-group communication/compute overlap pipeline."""
+
+        origin_hidden_states_dim = hidden_states.shape[-1]
+        assert self.quant_method is not None
+
+        if self._dwdp_bound:
+            dwdp_mgr = get_global_dwdp_manager()
+            dwdp_mgr.wait_prefetch(self.layer_id)
+
+        with use_symmetric_memory(
+            get_tp_group(), disabled=not is_allocation_symmetric()
+        ):
+            final_hidden_states = self.expert_group_executor.run(
+                self, hidden_states, topk_output
+            )
+
+            final_hidden_states = final_hidden_states[
+                ..., :origin_hidden_states_dim
+            ].contiguous()
+
+        if self._dwdp_bound:
+            dwdp_mgr.record_compute_and_prefetch_next(self.layer_id)
 
         if self.reduce_results and (self.moe_tp_size > 1 or self.moe_ep_size > 1):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)

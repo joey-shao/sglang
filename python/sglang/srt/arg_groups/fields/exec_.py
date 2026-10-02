@@ -706,6 +706,16 @@ class ExecMoe(msgspec.Struct):
         Literal["auto", "bf16", "fp8", "int8", "nvfp4"],
         "Select DeepEP dispatcher output dtype",
     ] = "auto"
+    enable_moe_expert_group_overlap: A[
+        bool,
+        "Enable experimental DeepEP v2 single-batch expert-group communication/"
+        "compute overlap (disables decode and prefill CUDA graphs).",
+    ] = False
+    moe_expert_group_count: A[
+        int,
+        "Number of contiguous local expert groups used by the experimental "
+        "expert-group MoE path. Phase one supports exactly 2.",
+    ] = 2
     flashinfer_a2a_dispatch_type: A[
         Optional[Literal["auto", "bf16", "nvfp4", "mxfp8"]],
         "Select FlashInfer A2A dispatcher activation dtype.",

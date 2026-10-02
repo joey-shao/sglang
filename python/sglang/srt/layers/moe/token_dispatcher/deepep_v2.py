@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import NamedTuple, Optional
+from typing import Any, NamedTuple, Optional
 
 import torch
 import torch.distributed as dist
@@ -20,6 +20,11 @@ from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.moe.utils import (
     DeepEPv2Fp8ScaleFormat,
     get_deepep_v2_fp8_scale_format,
+)
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    Phase,
+    check_cuda_graph_backend,
 )
 from sglang.srt.runtime_context import (
     get_exec,
@@ -65,6 +70,7 @@ class DeepEPv2DispatchOutput(NamedTuple):
     masked_max_m: int = 0
     total_expanded: int = 0
     expert_alignment: int = 128
+    event: Any = None
 
     @property
     def format(self) -> DispatchOutputFormat:
@@ -137,6 +143,7 @@ class DeepEPv2Buffer:
     """Facade for the process-wide ElasticBuffer stored in runtime resources."""
 
     _STATE_KEY = "deepep_v2_ep_state"
+    _PREFER_OVERLAP_WITH_COMPUTE = False
 
     @classmethod
     def _state(cls):
@@ -190,7 +197,7 @@ class DeepEPv2Buffer:
             use_fp8_dispatch=use_fp8_dispatch,
             allow_hybrid_mode=allow_hybrid_mode,
             sl_idx=0,
-            prefer_overlap_with_compute=False,
+            prefer_overlap_with_compute=cls._PREFER_OVERLAP_WITH_COMPUTE,
         )
         # Publish only after collective construction succeeds.
         state.buffer = buffer
@@ -226,8 +233,10 @@ class _DeepEPv2Impl:
         hidden_size: int,
         scale_format: DeepEPv2Fp8ScaleFormat,
         num_max_dispatch_tokens_per_rank: int,
+        buffer_pool=DeepEPv2Buffer,
     ):
         self.group = group
+        self.buffer_pool = buffer_pool
         self.router_topk = router_topk
         self.num_experts = num_experts
         self.num_local_experts = num_local_experts
@@ -242,7 +251,7 @@ class _DeepEPv2Impl:
         self._handle = None
 
     def _get_buffer(self) -> ElasticBuffer:
-        return DeepEPv2Buffer.get_buffer(
+        return self.buffer_pool.get_buffer(
             self.group,
             self.hidden_size,
             self.router_topk,
@@ -276,9 +285,14 @@ class _DeepEPv2Impl:
                 f"got {topk_ids.shape[1]}"
             )
 
+    @property
+    def use_expert_group_overlap(self) -> bool:
+        return get_exec().moe.enable_moe_expert_group_overlap
+
     def dispatch(
         self, hidden_states: torch.Tensor, topk_output: TopKOutput
     ) -> DeepEPv2DispatchOutput:
+        """Dispatch tokens and attach the native completion event to the output."""
         if self._handle is not None:
             raise RuntimeError(
                 "DeepEP v2 dispatch called while the previous dispatch handle is "
@@ -288,8 +302,16 @@ class _DeepEPv2Impl:
         topk_weights = topk_output.topk_weights
         topk_ids = topk_output.topk_ids.to(torch.int64)
         self._validate_common(hidden_states, topk_ids)
-        # Decode uses expanded/masked layout; extend uses contiguous in both modes.
-        use_expand_layout = not get_is_extend_in_batch()
+        # Async groups and graph-enabled prefill share decode's masked layout.
+        use_expand_layout = (
+            self.use_expert_group_overlap
+            or not get_is_extend_in_batch()
+            # Use the configured layout during warmup and eager fallback too.
+            or any(
+                check_cuda_graph_backend(Phase.PREFILL, backend)
+                for backend in (Backend.FULL, Backend.BREAKABLE, Backend.TC_PIECEWISE)
+            )
+        )
         use_masked = use_expand_layout
 
         # CPU-synced dispatch needs a dummy token to notify from an idle rank.
@@ -321,12 +343,14 @@ class _DeepEPv2Impl:
 
         # This collective argument must not depend on a rank-local batch.
         num_max_tokens = self.num_max_dispatch_tokens_per_rank
-        # Masked dispatch stays asynchronous for CUDA graph capture.
-        do_cpu_sync_val = True
-        if use_masked:
-            do_cpu_sync_val = False
+        # Masked dispatch keeps receive counts on the GPU, including capture.
+        do_cpu_sync_val = not use_masked
 
         buffer = self._get_buffer()
+        # The event covers quantization and route conversion.
+        previous_event = None
+        if self.use_expert_group_overlap:
+            previous_event = buffer.capture()
         recv_x, recv_topk_idx, recv_topk_weights, handle, event = buffer.dispatch(
             dispatch_x,
             topk_idx=topk_ids,
@@ -338,11 +362,12 @@ class _DeepEPv2Impl:
             use_tma_aligned_col_major_sf=use_tma_aligned_col_major_sf,
             do_cpu_sync=do_cpu_sync_val,
             do_expand=use_expand_layout,
+            previous_event=previous_event,
+            async_with_compute_stream=self.use_expert_group_overlap,
+            allocate_on_comm_stream=self.use_expert_group_overlap,
         )
         self._handle = handle
         local_tokens = hidden_states.shape[0]
-        if event.event is not None:
-            event.current_stream_wait()
 
         if isinstance(recv_x, tuple):
             recv_hidden_states, recv_hidden_states_scale = recv_x
@@ -393,9 +418,13 @@ class _DeepEPv2Impl:
             masked_max_m,
             total_expanded,
             _EXPERT_ALIGNMENT,
+            event=event,
         )
 
-    def combine(self, combine_input: DeepEPv2CombineInput) -> torch.Tensor:
+    def combine(
+        self,
+        combine_input: DeepEPv2CombineInput,
+    ):
         if self._handle is None:
             raise RuntimeError(
                 "DeepEP v2 combine called without a valid dispatch handle"
@@ -407,11 +436,12 @@ class _DeepEPv2Impl:
                 combine_input.hidden_states,
                 handle=self._handle,
                 topk_weights=combine_input.topk_weights,
+                async_with_compute_stream=self.use_expert_group_overlap,
             )
-            if event.event is not None:
-                event.current_stream_wait()
             if self._pad_empty_combine:
                 combined_x = combined_x[:0]
+            if self.use_expert_group_overlap:
+                return combined_x, event
             return combined_x
         finally:
             self._pad_empty_combine = False
@@ -427,6 +457,7 @@ class DeepEPv2Dispatcher(BaseDispatcher):
         num_local_experts: int,
         hidden_size: int,
         params_dtype: torch.dtype,
+        buffer_pool=DeepEPv2Buffer,
     ):
         super().__init__()
         if params_dtype != torch.bfloat16:
@@ -446,14 +477,18 @@ class DeepEPv2Dispatcher(BaseDispatcher):
             hidden_size=hidden_size,
             scale_format=scale_format,
             num_max_dispatch_tokens_per_rank=self.num_max_dispatch_tokens_per_rank,
+            buffer_pool=buffer_pool,
         )
 
-    def dispatch(
-        self, hidden_states: torch.Tensor, topk_output: TopKOutput
-    ) -> DispatchOutput:
+    def prepare_buffer(self) -> None:
+        """Finish collective buffer initialization before overlap is enqueued."""
+        self._impl._get_buffer()
+
+    def dispatch(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
         return self._impl.dispatch(hidden_states, topk_output)
 
-    def combine(self, combine_input: CombineInput) -> torch.Tensor:
+    def combine(self, combine_input: CombineInput):
+        """Return (tensor, event) for expert-group overlap; otherwise wait."""
         if combine_input.format != CombineInputFormat.DEEPEP_V2:
             raise TypeError(
                 f"Expected DeepEP v2 combine input, got {combine_input.format}"

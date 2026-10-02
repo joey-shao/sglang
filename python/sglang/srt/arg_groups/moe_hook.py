@@ -362,14 +362,6 @@ def handle_a2a_moe(server_args: Any):
                 "Remove --enforce-shared-experts-fusion when using "
                 "--moe-a2a-backend deepep_v2."
             )
-        # Prefill reads host counts and is not graph-capturable.
-        declare_resolution(
-            server_args,
-            "_handle_a2a_moe",
-            cuda_graph_config=with_phase(
-                cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
-            ),
-        )
         logger.warning(
             f"DeepEP v2 MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{cfg.tp_size}]."
         )
@@ -377,8 +369,9 @@ def handle_a2a_moe(server_args: Any):
             "DeepEP v2 MoE is using deepep_v2_mode=%s. This controls "
             "ElasticBuffer direct/hybrid mode and is independent from "
             "--deepep-mode normal/low_latency. DeepEP v2 MoE enables the "
-            "decode CUDA graph on the masked decode path (any comm mode) "
-            "and disables shared expert fusion. "
+            "decode CUDA graph on the masked decode path (any comm mode); "
+            "prefill also uses masked GEMM when its CUDA graph is enabled. "
+            "Shared expert fusion is disabled. "
             "SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK is a "
             "per-rank communication buffer capacity, not a model limit; "
             "increase it for large prefill/chunked-prefill workloads.",
@@ -388,6 +381,29 @@ def handle_a2a_moe(server_args: Any):
     # The resolving view, not the field: `_a2a_backend_overrides` may have
     # moved this already (waterfill forces `deepep`).
     a2a_now = resolved_view(server_args).moe_a2a_backend
+
+    if cfg.enable_moe_expert_group_overlap:
+        if a2a_now != "deepep_v2":
+            raise ValueError(
+                "--enable-moe-expert-group-overlap requires "
+                "--moe-a2a-backend deepep_v2."
+            )
+        if cfg.moe_expert_group_count != 2:
+            raise ValueError(
+                "Phase one of --enable-moe-expert-group-overlap supports exactly "
+                "--moe-expert-group-count 2."
+            )
+        if cfg.enable_two_batch_overlap or cfg.enable_single_batch_overlap:
+            raise ValueError(
+                "--enable-moe-expert-group-overlap cannot be combined with "
+                "--enable-two-batch-overlap or --enable-single-batch-overlap."
+            )
+        if cfg.enforce_shared_experts_fusion:
+            raise ValueError(
+                "--enable-moe-expert-group-overlap has not validated fused shared "
+                "experts. Remove --enforce-shared-experts-fusion."
+            )
+
     if (a2a_now == "none" and get_platform().is_npu) or a2a_now == "ascend_tp":
         # FIXME (OrangeRedeng): for some reasons if pass "ascend_tp" accuracy drops to zero
         declare_resolution(
@@ -557,13 +573,21 @@ def validate_deepep_v2_dispatch_token_budget(server_args: Any) -> None:
         prefill_tokens = max_prefill_buffer_tokens(server_args) or (
             view.max_prefill_tokens or 0
         )
+        prefill_config = view.cuda_graph_config.prefill
+        if prefill_config.backend != Backend.DISABLED:
+            # Capture/replay may pad beyond the scheduler's token budget.
+            prefill_tokens = max(
+                prefill_tokens,
+                prefill_config.max_bs or 0,
+                max(prefill_config.bs or [0]),
+            )
         if prefill_tokens > capacity:
             raise ValueError(
                 "DeepEP v2 per-rank prefill budget exceeds "
                 "SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK: "
                 f"required={prefill_tokens}, capacity={capacity}. Raise the "
                 "environment value or lower --chunked-prefill-size/"
-                "--max-prefill-tokens."
+                "--max-prefill-tokens or the prefill CUDA graph buckets."
             )
 
     if view.disaggregation_mode == "prefill":

@@ -2560,6 +2560,61 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             block_shape=self.weight_block_size,
         )
 
+    def get_expert_group_quant_info(
+        self,
+        layer: torch.nn.Module,
+        runner_backend,
+        *,
+        expert_slice: slice,
+    ) -> DeepGemmMoeQuantInfo:
+        """Build DeepGEMM quantization info for the selected local experts."""
+        if not runner_backend.is_deep_gemm():
+            return super().get_expert_group_quant_info(
+                layer, runner_backend, expert_slice=expert_slice
+            )
+
+        w13_weight = layer.w13_weight[expert_slice]
+        w2_weight = layer.w2_weight[expert_slice]
+
+        if self.block_quant:
+            block_shape = self.quant_config.weight_block_size
+            w13_scale = layer.w13_weight_scale_inv[expert_slice]
+            w2_scale = layer.w2_weight_scale_inv[expert_slice]
+        else:
+            # DeepGEMM consumes block-shaped scales. Convert each selected
+            # expert's per-tensor scale without materializing unselected groups.
+            scale_block_size = 128
+            block_shape = [scale_block_size, scale_block_size]
+            w13_scale_n = (w13_weight.shape[1] - 1) // scale_block_size + 1
+            w13_scale_k = (w13_weight.shape[2] - 1) // scale_block_size + 1
+            w13_scale = (
+                layer.w13_weight_scale[expert_slice]
+                .unsqueeze(1)
+                .repeat_interleave(w13_scale_n, dim=1)
+                .unsqueeze(2)
+                .repeat_interleave(w13_scale_k, dim=2)
+            )
+            w2_scale_n = (w2_weight.shape[1] - 1) // scale_block_size + 1
+            w2_scale_k = (w2_weight.shape[2] - 1) // scale_block_size + 1
+            w2_scale = (
+                layer.w2_weight_scale[expert_slice]
+                .unsqueeze(1)
+                .repeat_interleave(w2_scale_n, dim=1)
+                .unsqueeze(2)
+                .repeat_interleave(w2_scale_k, dim=2)
+            )
+
+        return DeepGemmMoeQuantInfo(
+            w13_weight=w13_weight,
+            w2_weight=w2_weight,
+            use_fp8=True,
+            w13_scale=w13_scale,
+            w2_scale=w2_scale,
+            block_shape=block_shape,
+            is_fp4_experts=self.is_fp4_expert,
+            use_mxfp8=self.use_mxfp8,
+        )
+
     def _process_npu_fp4_expert_weights(self, layer: torch.nn.Module) -> None:
         """Convert HF MXFP4 experts to the NPU W4A8 kernel layout.
 
