@@ -312,7 +312,7 @@ def disable_breakable_cudagraph_if_incompatible(server_args: Any):
             "unvalidated a2a backend",
             lambda: (
                 resolved_view(server_args).moe_a2a_backend
-                not in ("none", "deepep", "megamoe", "flashinfer")
+                not in ("none", "deepep", "deepep_v2", "megamoe", "flashinfer")
             ),
         ),
         # Multimodal prefill replay faults under BCG; allowlisted archs opt back in.

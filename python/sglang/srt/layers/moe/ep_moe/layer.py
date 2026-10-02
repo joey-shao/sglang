@@ -223,8 +223,12 @@ class DeepEPMoE(FusedMoE):
         hidden_states: torch.Tensor,
         topk_output: TopKOutput,
     ):
-        # DeepEP NORMAL mode is not capturable; run it as an eager node.
         if is_in_breakable_cuda_graph():
+            # V2 uses a graph-compatible masked layout. Keep its communication
+            # and GEMMs in this segment instead of replaying an eager MoE break.
+            if get_moe_a2a_backend().is_deepep_v2():
+                return self.forward_impl(hidden_states, topk_output)
+            # Legacy A2A paths still need the eager node and capture stub.
             assert TopKOutputChecker.format_is_standard(topk_output), (
                 "Only standard topk output is supported for breakable cuda graph"
             )
