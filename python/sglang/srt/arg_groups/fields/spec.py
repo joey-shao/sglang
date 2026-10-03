@@ -185,6 +185,7 @@ class Spec(msgspec.Struct):
                 "flashinfer",
                 "megamoe",
                 "deepep_v2",
+                "deepep_v2.5",
                 "pplx",
                 "ascend_tp",
             ],

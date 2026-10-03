@@ -82,11 +82,12 @@ class MoeRunner:
                 "--moe-runner-backend hpc_ops for this model."
             )
 
-        if get_moe_a2a_backend().is_deepep_v2() and not runner_backend.is_deep_gemm():
+        if get_moe_a2a_backend().is_deepep_v2_family() and not runner_backend.is_deep_gemm():
             raise ValueError(
-                "--moe-a2a-backend deepep_v2 requires the deep_gemm MoE runner, "
+                f"--moe-a2a-backend {get_moe_a2a_backend().value} requires the "
+                "deep_gemm MoE runner, "
                 f"but this MoE layer's quantization method selected the "
-                f"'{runner_backend.value}' runner. deepep_v2 dispatches into "
+                f"'{runner_backend.value}' runner. This backend dispatches into "
                 "the deep_gemm grouped-GEMM layout (FP8 activations plus "
                 "scales, or BF16 activations for unquantized experts); use an "
                 "FP8 blockwise-quantized or BF16 checkpoint, or "

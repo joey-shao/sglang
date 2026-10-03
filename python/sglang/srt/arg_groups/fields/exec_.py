@@ -718,6 +718,7 @@ class ExecMoe(msgspec.Struct):
             "flashinfer",
             "megamoe",
             "deepep_v2",
+            "deepep_v2.5",
             "ascend_tp",
             "pplx",
             "flashinfer_megamoe",
@@ -734,6 +735,7 @@ class ExecMoe(msgspec.Struct):
                 "flashinfer",
                 "megamoe",
                 "deepep_v2",
+            "deepep_v2.5",
                 "pplx",
                 "ascend_tp",
                 "flashinfer_megamoe",
@@ -749,7 +751,7 @@ class ExecMoe(msgspec.Struct):
     ] = False
     deepep_v2_mode: A[
         Literal["direct", "hybrid"],
-        "DeepEP v2 ElasticBuffer communication topology, fixed at server init: "
+        "DeepEP v2/v2.5 communication topology, fixed at server init: "
         "`direct` (single-node NVLink) or `hybrid` (multi-node scale-out). "
         "Layout/grouped-GEMM and the decode CUDA graph are chosen per batch by "
         "inference phase, independent of this knob; not equivalent to DeepEP v1 "

@@ -38,6 +38,7 @@ from sglang.srt.layers.moe.token_dispatcher.ascend_tp import (
 )
 from sglang.srt.layers.moe.token_dispatcher.base import BaseDispatcher
 from sglang.srt.layers.moe.token_dispatcher.deepep_v2 import DeepEPv2Dispatcher
+from sglang.srt.layers.moe.token_dispatcher.deepep_v2_5 import DeepEPv25Dispatcher
 from sglang.srt.layers.moe.token_dispatcher.flashinfer import FlashinferDispatcher
 from sglang.srt.layers.moe.token_dispatcher.standard import (
     StandardDispatcher,
@@ -197,11 +198,16 @@ def create_moe_dispatcher(
             async_finish=True,
             return_recv_hook=True,
         )
-    elif a2a_backend.is_deepep_v2():
+    elif a2a_backend.is_deepep_v2_family():
         output_dtype = get_deepep_v2_dispatcher_output_dtype(
             _deepep_v2_experts_are_fp8(quant_method)
         )
-        return DeepEPv2Dispatcher(
+        dispatcher_class = (
+            DeepEPv25Dispatcher
+            if a2a_backend.is_deepep_v25()
+            else DeepEPv2Dispatcher
+        )
+        return dispatcher_class(
             group=get_parallel().tp_group.device_group,
             router_topk=moe_runner_config.top_k,
             num_experts=moe_runner_config.num_experts,
@@ -260,7 +266,7 @@ def _deepep_v2_experts_are_fp8(quant_method) -> bool:
 
 def _validate_deepep_v2_quant_method(quant_method) -> None:
     """Validate the expert formats the DeepEP v2 adapter can feed."""
-    if not get_moe_a2a_backend().is_deepep_v2():
+    if not get_moe_a2a_backend().is_deepep_v2_family():
         return
 
     if isinstance(quant_method, UnquantizedFusedMoEMethod):
@@ -284,7 +290,8 @@ def _validate_deepep_v2_quant_method(quant_method) -> None:
 
     if reason is not None:
         raise ValueError(
-            "--moe-a2a-backend deepep_v2 requires 128x128 blockwise FP8 or 1x32 MXFP8 "
+            f"--moe-a2a-backend {get_moe_a2a_backend().value} requires "
+            "128x128 blockwise FP8 or 1x32 MXFP8 "
             "experts with dynamic activation scaling or unquantized BF16 "
             f"experts, but this layer {reason}. Use a compatible checkpoint or "
             "--moe-a2a-backend deepep."
@@ -489,7 +496,7 @@ class FusedMoE(torch.nn.Module):
         _validate_hpc_ops_quant_method(self.quant_method)
         _validate_deepep_v2_quant_method(self.quant_method)
         if (
-            get_moe_a2a_backend().is_deepep_v2()
+            get_moe_a2a_backend().is_deepep_v2_family()
             and isinstance(self.quant_method, Fp8MoEMethod)
             and self.quant_method.use_mxfp8
         ):

@@ -43,6 +43,7 @@ class MoeA2ABackend(Enum):
     FLASHINFER = "flashinfer"
     MEGAMOE = "megamoe"
     DEEPEP_V2 = "deepep_v2"
+    DEEPEP_V25 = "deepep_v2.5"
     PPLX = "pplx"
     FLASHINFER_MEGAMOE = "flashinfer_megamoe"
     CUSTOMIZED = "customized"
@@ -85,6 +86,12 @@ class MoeA2ABackend(Enum):
 
     def is_deepep_v2(self):
         return self == MoeA2ABackend.DEEPEP_V2
+
+    def is_deepep_v25(self):
+        return self == MoeA2ABackend.DEEPEP_V25
+
+    def is_deepep_v2_family(self):
+        return self.is_deepep_v2() or self.is_deepep_v25()
 
     def is_pplx(self):
         return self == MoeA2ABackend.PPLX
@@ -419,7 +426,7 @@ def get_deepep_v2_dispatcher_output_dtype(
     if requested != "auto" and DispatcherOutputDtype(requested) is not required:
         raise ValueError(
             f"--deepep-dispatcher-output-dtype {requested} contradicts this "
-            f"checkpoint: --moe-a2a-backend deepep_v2 dispatches "
+            f"checkpoint: DeepEP v2/v2.5 dispatches "
             f"{required.value} for "
             f"{'FP8 blockwise' if experts_are_fp8 else 'BF16'} experts. Drop "
             "the flag to let it follow the checkpoint."
@@ -637,7 +644,7 @@ def is_deepep_class_backend() -> bool:
     b = get_moe_a2a_backend()
     return (
         b.is_deepep()
-        or b.is_deepep_v2()
+        or b.is_deepep_v2_family()
         or b.is_mooncake()
         or b.is_mori()
         or b.is_pplx()

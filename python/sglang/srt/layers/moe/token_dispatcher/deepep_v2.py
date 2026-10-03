@@ -45,15 +45,6 @@ except (ImportError, OSError) as exc:
     use_deepep_v2 = False
     _deepep_v2_import_error = exc
 
-if use_deepep_v2:
-    try:
-        from sglang.kernels.ops.quantization.fp8_kernel import (
-            sglang_per_token_group_quant_fp8,
-        )
-    except (ImportError, OSError) as exc:
-        _fp8_quant_import_error = exc
-
-
 class DeepEPv2DispatchOutput(NamedTuple):
     hidden_states: torch.Tensor
     hidden_states_scale: Optional[torch.Tensor]
@@ -106,7 +97,15 @@ def _ensure_deepep_v2_available() -> None:
 
 
 def _ensure_fp8_quant_available() -> None:
-    _ensure_deepep_v2_available()
+    # Shared with the v2.5 adapter, which does not require ElasticBuffer.
+    global sglang_per_token_group_quant_fp8, _fp8_quant_import_error
+    if sglang_per_token_group_quant_fp8 is None and _fp8_quant_import_error is None:
+        try:
+            from sglang.kernels.ops.quantization.fp8_kernel import (
+                sglang_per_token_group_quant_fp8,
+            )
+        except (ImportError, OSError) as exc:
+            _fp8_quant_import_error = exc
     if sglang_per_token_group_quant_fp8 is None:
         detail = (
             f" Original import error: {_fp8_quant_import_error}"
@@ -144,6 +143,14 @@ class DeepEPv2Buffer:
 
     _STATE_KEY = "deepep_v2_ep_state"
 
+    @staticmethod
+    def _ensure_available() -> None:
+        _ensure_deepep_v2_available()
+
+    @staticmethod
+    def _buffer_type():
+        return ElasticBuffer
+
     @classmethod
     def _state(cls):
         from types import SimpleNamespace
@@ -164,13 +171,13 @@ class DeepEPv2Buffer:
         num_max_dispatch_tokens_per_rank: int,
         use_fp8_dispatch: bool,
         allow_hybrid_mode: Optional[bool] = None,
-    ) -> ElasticBuffer:
-        _ensure_deepep_v2_available()
+    ):
+        cls._ensure_available()
 
         if allow_hybrid_mode is None:
             allow_hybrid_mode = _get_allow_hybrid_mode()
         state = cls._state()
-        # A key change rebuilds ElasticBuffer collectively on every rank.
+        # A key change rebuilds the EP buffer collectively on every rank.
         key = (
             group,
             hidden_size,
@@ -188,7 +195,7 @@ class DeepEPv2Buffer:
 
         # Communicator reuse requires a device-bound process group.
         os.environ.setdefault("EP_REUSE_NCCL_COMM", "0")
-        buffer = ElasticBuffer(
+        buffer = cls._buffer_type()(
             group,
             num_max_tokens_per_rank=num_max_dispatch_tokens_per_rank,
             hidden=hidden_size,
@@ -202,9 +209,10 @@ class DeepEPv2Buffer:
         state.buffer = buffer
         state.key = key
         logger.info(
-            "Initialized DeepEP v2 ElasticBuffer: world_size=%s hidden_size=%s "
+            "Initialized DeepEP %s: world_size=%s hidden_size=%s "
             "num_topk=%s max_dispatch_tokens_per_rank=%s use_fp8_dispatch=%s "
             "allow_hybrid_mode=%s num_bytes=%s",
+            type(buffer).__name__,
             dist.get_world_size(group),
             hidden_size,
             router_topk,
@@ -223,6 +231,8 @@ class DeepEPv2Buffer:
 
 
 class _DeepEPv2Impl:
+    buffer_class = DeepEPv2Buffer
+
     def __init__(
         self,
         group: dist.ProcessGroup,
@@ -250,8 +260,8 @@ class _DeepEPv2Impl:
     def _destroy_handle(self) -> None:
         self._handle = None
 
-    def _get_buffer(self) -> ElasticBuffer:
-        return DeepEPv2Buffer.get_buffer(
+    def _get_buffer(self):
+        return self.buffer_class.get_buffer(
             self.group,
             self.hidden_size,
             self.router_topk,
@@ -293,7 +303,7 @@ class _DeepEPv2Impl:
                 "DeepEP v2 dispatch called while the previous dispatch handle is "
                 "still unconsumed (missing combine)"
             )
-        _ensure_deepep_v2_available()
+        self.buffer_class._ensure_available()
         topk_weights = topk_output.topk_weights
         topk_ids = topk_output.topk_ids.to(torch.int64)
         self._validate_common(hidden_states, topk_ids)
@@ -339,6 +349,9 @@ class _DeepEPv2Impl:
             do_cpu_sync_val = False
 
         buffer = self._get_buffer()
+        # Keep the non-deferred tuple API shared by v2 and v2.5. In v2.5,
+        # defer_epilogue=True would instead return an EventOverlap whose wait
+        # materializes the receive tensors and handle.
         recv_x, recv_topk_idx, recv_topk_weights, handle, event = buffer.dispatch(
             dispatch_x,
             topk_idx=topk_ids,
@@ -374,7 +387,7 @@ class _DeepEPv2Impl:
             if recv_hidden_states_scale is not None:
                 recv_hidden_states_scale = recv_hidden_states_scale[:num_recv_tokens]
 
-            # ElasticBuffer already converts global router IDs to receiver-local
+            # DeepEP already converts global router IDs to receiver-local
             # expert IDs; applying this rank's offset again would discard routes.
             local_topk_ids = recv_topk_idx
 
@@ -445,6 +458,8 @@ class _DeepEPv2Impl:
 
 
 class DeepEPv2Dispatcher(BaseDispatcher):
+    impl_class = _DeepEPv2Impl
+
     def __init__(
         self,
         group: dist.ProcessGroup,
@@ -467,7 +482,7 @@ class DeepEPv2Dispatcher(BaseDispatcher):
             envs.SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
         )
         self.use_fp8_dispatch = use_fp8_dispatch
-        self._impl = _DeepEPv2Impl(
+        self._impl = self.impl_class(
             group=group,
             router_topk=router_topk,
             num_experts=num_experts,
