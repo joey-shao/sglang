@@ -76,6 +76,7 @@ from sglang.srt.model_loader.weight_utils import narrow_padded_param_and_loaded_
 from sglang.srt.runtime_context import (
     get_exec,
     get_global_dwdp_manager,
+    get_global_online_eplb_manager,
     get_parallel,
     get_server_args,
     process_model_config,
@@ -203,9 +204,7 @@ def create_moe_dispatcher(
             _deepep_v2_experts_are_fp8(quant_method)
         )
         dispatcher_class = (
-            DeepEPv25Dispatcher
-            if a2a_backend.is_deepep_v25()
-            else DeepEPv2Dispatcher
+            DeepEPv25Dispatcher if a2a_backend.is_deepep_v25() else DeepEPv2Dispatcher
         )
         return dispatcher_class(
             group=get_parallel().tp_group.device_group,
@@ -581,6 +580,10 @@ class FusedMoE(torch.nn.Module):
     @property
     def num_global_routed_experts(self) -> int:
         return self._num_global_routed
+
+    def get_online_expert_weights(self):
+        """Return master weights and scales for online EPLB prefetch."""
+        return self.quant_method.get_online_expert_weights(self)
 
     def bind_full_expert_weights(self, weights: Dict[str, torch.Tensor]) -> None:
         """Rebind this layer's expert weight tensors to externally provided
@@ -1578,6 +1581,11 @@ class FusedMoE(torch.nn.Module):
         if self._dwdp_bound:
             dwdp_mgr = get_global_dwdp_manager()
             dwdp_mgr.wait_prefetch(self.layer_id)
+
+        if get_exec().moe.enable_online_eplb and not self.is_shared_fused_moe:
+            online_eplb_mgr = get_global_online_eplb_manager()
+            if online_eplb_mgr.active:
+                online_eplb_mgr.wait_prefetch(self)
 
         dispatch_output = self._dispatch_with_pre_quant(
             hidden_states, topk_output, pre_quant_input

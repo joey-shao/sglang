@@ -40,6 +40,7 @@ if TYPE_CHECKING:
 
 from sglang.srt.runtime_context import (
     get_exec,
+    get_global_online_eplb_manager,
     get_lora,
     get_parallel,
     get_server_args,
@@ -121,6 +122,7 @@ from sglang.srt.utils import (
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
     from sglang.srt.layers.quantization import QuantizationConfig
 
 
@@ -639,6 +641,7 @@ class TopK(BaseFusedOp):
         num_token_non_padded: Optional[torch.Tensor] = None,
         expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
         dynamic_expert_bias: Optional[torch.Tensor] = None,
+        moe_layer: Optional[FusedMoE] = None,
     ) -> TopKOutput:
         self.topk_config.torch_native = True
         topk_output = select_experts(
@@ -649,6 +652,7 @@ class TopK(BaseFusedOp):
             num_token_non_padded=num_token_non_padded,
             expert_location_dispatch_info=expert_location_dispatch_info,
             dynamic_expert_bias=dynamic_expert_bias,
+            moe_layer=moe_layer,
         )
         return self._apply_waterfill(topk_output, hidden_states.shape[0])
 
@@ -660,8 +664,9 @@ class TopK(BaseFusedOp):
         num_token_non_padded: Optional[torch.Tensor] = None,
         expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
         dynamic_expert_bias: Optional[torch.Tensor] = None,
+        moe_layer: Optional[FusedMoE] = None,
     ) -> TopKOutput:
-        if dynamic_expert_bias is not None:
+        if _online_eplb_enabled() or dynamic_expert_bias is not None:
             output_format = TopKOutputFormat.STANDARD
         elif self.topk_config.output_format is not None:
             output_format = self.topk_config.output_format
@@ -727,6 +732,7 @@ class TopK(BaseFusedOp):
                     num_token_non_padded=num_token_non_padded,
                     expert_location_dispatch_info=expert_location_dispatch_info,
                     dynamic_expert_bias=dynamic_expert_bias,
+                    moe_layer=moe_layer,
                 )
         return self._apply_waterfill(topk_output, hidden_states.shape[0])
 
@@ -738,6 +744,7 @@ class TopK(BaseFusedOp):
         num_token_non_padded: Optional[torch.Tensor] = None,
         expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
         dynamic_expert_bias: Optional[torch.Tensor] = None,
+        moe_layer: Optional[FusedMoE] = None,
     ) -> TopKOutput:
         topk_output = select_experts(
             hidden_states=hidden_states,
@@ -747,6 +754,7 @@ class TopK(BaseFusedOp):
             num_token_non_padded=num_token_non_padded,
             expert_location_dispatch_info=expert_location_dispatch_info,
             dynamic_expert_bias=dynamic_expert_bias,
+            moe_layer=moe_layer,
         )
         return self._apply_waterfill(topk_output, hidden_states.shape[0])
 
@@ -758,6 +766,7 @@ class TopK(BaseFusedOp):
         num_token_non_padded: Optional[torch.Tensor] = None,
         expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
         dynamic_expert_bias: Optional[torch.Tensor] = None,
+        moe_layer: Optional[FusedMoE] = None,
     ) -> TopKOutput:
         if dynamic_expert_bias is not None:
             self.topk_config.torch_native = False
@@ -769,6 +778,7 @@ class TopK(BaseFusedOp):
                 num_token_non_padded=num_token_non_padded,
                 expert_location_dispatch_info=expert_location_dispatch_info,
                 dynamic_expert_bias=dynamic_expert_bias,
+                moe_layer=moe_layer,
             )
 
         from sglang.srt.hardware_backend.npu.moe.topk import fused_topk_npu
@@ -783,16 +793,25 @@ class TopK(BaseFusedOp):
         )
 
     def empty_topk_output(
-        self, device: torch.device, *, layer_id: Optional[int] = None
+        self,
+        device: torch.device,
+        *,
+        layer_id: Optional[int] = None,
+        expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
+        moe_layer: Optional[FusedMoE] = None,
     ) -> TopKOutput:
         """Return an empty topk output for a rank with zero tokens this forward.
 
         When ``layer_id`` is provided and the active dispatch algorithm is LP,
         also calls ``LPLBSolver.solve(empty)`` so that this rank participates
         in the EP all-reduce. Without this, an empty rank would skip the
-        collective and deadlock under DP-attention.
+        collective and deadlock under DP-attention. Online dispatch similarly
+        runs the common post-process with the explicitly supplied MoE layer.
         """
-        if layer_id is not None:
+        if (
+            expert_location_dispatch_info is None
+            or expert_location_dispatch_info.ep_dispatch_algorithm == "lp"
+        ):
             # Skip the full ExpertLocationDispatchInfo allocation — we only
             # need the per-layer solver to participate in the EP all-reduce.
             from sglang.srt.eplb.lplb_solver import get_global_lplb_solver
@@ -814,6 +833,22 @@ class TopK(BaseFusedOp):
             topk_ids = torch.full((0, topk), -1, dtype=torch.int32, device=device)
         # FIXME: router_logits should be of size (0, num_experts)
         router_logits = torch.empty((0, topk), dtype=torch.float32, device=device)
+        if (
+            expert_location_dispatch_info is not None
+            and expert_location_dispatch_info.ep_dispatch_algorithm == "online"
+        ):
+            topk_ids, topk_weights, recorder_ids = _post_process_topk_ids(
+                topk_ids,
+                topk_weights,
+                self.topk_config,
+                router_logits,
+                self.layer_id if layer_id is None else layer_id,
+                expert_location_dispatch_info=expert_location_dispatch_info,
+                moe_layer=moe_layer,
+            )
+            get_global_expert_distribution_recorder().on_select_experts(
+                topk_ids=recorder_ids
+            )
         topk_output = StandardTopKOutput(topk_weights, topk_ids, router_logits)
         if has_per_rank_fused_shared_slots(self.topk_config.num_fused_shared_experts):
             n = self.topk_config.num_fused_shared_experts
@@ -834,6 +869,7 @@ class TopK(BaseFusedOp):
         *,
         num_token_non_padded: Optional[torch.Tensor] = None,
         expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
+        moe_layer: Optional[FusedMoE] = None,
     ) -> TopKOutput:
         self.topk_config.torch_native = True
         # [NOTE] XPU device support for topk kernels
@@ -850,6 +886,7 @@ class TopK(BaseFusedOp):
             topk_config=self.topk_config,
             num_token_non_padded=num_token_non_padded,
             expert_location_dispatch_info=expert_location_dispatch_info,
+            moe_layer=moe_layer,
         )
 
 
@@ -1620,6 +1657,10 @@ def _eplb_remap_enabled() -> bool:
         # (e.g. in unit tests that call select_experts directly). In that case
         # there is no EPLB mapping, so the remap must be skipped.
         return False
+    if get_exec().moe.enable_online_eplb:
+        # Online mapping is explicit in _post_process_topk_ids; this predicate
+        # controls only the existing static/LP remap optimizations.
+        return False
     return (
         get_exec().moe.enable_eplb
         or get_exec().moe.init_expert_location != "trivial"
@@ -1644,6 +1685,7 @@ def _fused_gate_emits_packed_ids(
     # the caller's opt-in rules out a later rewrite of ids or weights.
     return (
         enabled
+        and not _online_eplb_enabled()
         and _fused_gate_masks_padded_rows(scoring_func)
         and get_moe_runner_backend().is_flashinfer_mxfp4()
         and expert_location_dispatch_info is None
@@ -2223,6 +2265,10 @@ def capture_routed_experts_if_allowed(
         )
 
 
+def _online_eplb_enabled() -> bool:
+    return get_exec().moe.enable_online_eplb
+
+
 def _post_process_topk_ids(
     topk_ids: torch.Tensor,
     topk_weights: torch.Tensor,
@@ -2232,6 +2278,7 @@ def _post_process_topk_ids(
     num_token_non_padded: Optional[torch.Tensor] = None,
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
     padded_rows_masked: bool = False,
+    moe_layer: Optional[FusedMoE] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     num_fused_shared_experts = topk_config.num_fused_shared_experts
     use_per_rank_shared_slots = has_per_rank_fused_shared_slots(
@@ -2245,6 +2292,16 @@ def _post_process_topk_ids(
     _fold_pad_into_append = False
     recorder_was_fused = False
     if _is_cuda:
+        online_plan = None
+        if (
+            expert_location_dispatch_info is not None
+            and expert_location_dispatch_info.ep_dispatch_algorithm == "online"
+        ):
+            manager = get_global_online_eplb_manager()
+            _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
+            if manager.active:
+                online_plan = manager.balance(moe_layer, topk_ids)
+
         # LP path: solve LP outside torch.compile (the solver contains an
         # EP all-reduce that can't run inside compiled regions).
         log2phy_prob = None
@@ -2258,7 +2315,11 @@ def _post_process_topk_ids(
             if lplb_solver is not None:
                 log2phy_prob = lplb_solver.solve(topk_ids)
 
-        if log2phy_prob is not None:
+        if online_plan is not None:
+            topk_ids = topk_ids_logical_to_physical(
+                topk_ids, expert_location_dispatch_info, online_plan=online_plan
+            )
+        elif log2phy_prob is not None:
             topk_ids = topk_ids_logical_to_physical(
                 topk_ids, expert_location_dispatch_info, log2phy_prob
             )
@@ -2456,6 +2517,7 @@ def select_experts(
     num_token_non_padded: Optional[torch.Tensor] = None,
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
     dynamic_expert_bias: Optional[torch.Tensor] = None,
+    moe_layer: Optional[FusedMoE] = None,
 ) -> StandardTopKOutput:
     top_k = topk_config.top_k
     use_grouped_topk = topk_config.use_grouped_topk
@@ -2652,6 +2714,7 @@ def select_experts(
                 _fused_topk_pack = lora_envs.SGLANG_OPT_LORA_FUSED_TOPK_PACK.get()
             if (
                 _fused_topk_pack
+                and not _online_eplb_enabled()
                 and _is_cuda
                 and not _use_aiter
                 and scoring_func == "softmax"
@@ -2739,6 +2802,7 @@ def select_experts(
         layer_id=layer_id,
         expert_location_dispatch_info=expert_location_dispatch_info,
         padded_rows_masked=padded_rows_masked,
+        moe_layer=moe_layer,
     )
 
     if recorder_topk_ids is not None:
@@ -2770,6 +2834,7 @@ def precomputed_topk_postprocess_is_noop(
     """
     return (
         _is_cuda
+        and not _online_eplb_enabled()
         and topk_config.num_fused_shared_experts == 0
         and num_token_non_padded is None
         and expert_location_dispatch_info is None
@@ -2789,6 +2854,10 @@ def build_precomputed_topk_output(
 
     Only valid when :func:`precomputed_topk_postprocess_is_noop` holds.
     """
+    if _online_eplb_enabled():
+        raise RuntimeError(
+            "Online EPLB precomputed routing must use top-k post-processing"
+        )
     capture_routed_experts_if_allowed(topk_config, layer_id, topk_ids)
     get_global_expert_distribution_recorder().on_select_experts(topk_ids=topk_ids)
     # router_logits is only read by the BYPASSED formats and by the

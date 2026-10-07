@@ -182,6 +182,7 @@ from sglang.srt.runtime_context import (
     get_device,
     get_exec,
     get_global_dwdp_manager,
+    get_global_online_eplb_manager,
     get_lora,
     get_memory,
     get_model,
@@ -192,6 +193,7 @@ from sglang.srt.runtime_context import (
     max_speculative_num_draft_tokens,
     remote_instance_transfer_engine_enabled,
     set_global_dwdp_manager,
+    set_global_online_eplb_manager,
 )
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_observer import SamplingObserver
@@ -669,6 +671,7 @@ class ModelRunner:
             draft_model_idx=self.draft_model_idx,
         )
         self.maybe_apply_post_load_model_transforms()
+        self.maybe_init_online_eplb_manager()
         self.maybe_init_lora_manager()
         self.maybe_enable_batch_invariant_mode()
         self.configure_kv_cache_dtype()
@@ -724,6 +727,13 @@ class ModelRunner:
             if get_exec().moe.enable_eplb and (not self.is_draft_worker)
             else None
         )
+
+    def maybe_init_online_eplb_manager(self):
+        if not get_exec().moe.enable_online_eplb:
+            return
+        from sglang.srt.eplb.online_eplb_manager import OnlineEplbManager
+
+        set_global_online_eplb_manager(OnlineEplbManager(self.model))
 
     def maybe_init_elastic_ep(self):
         if get_exec().moe.elastic_ep_backend:
@@ -1864,7 +1874,13 @@ class ModelRunner:
             ctx_mgr = contextlib.nullcontext()
         else:
             ctx_mgr = forward_context(ForwardContext(attn_backend=self.attn_backend))
-        with ctx_mgr:
+        online_manager = get_global_online_eplb_manager()
+        online_scope = (
+            online_manager.forward_scope(forward_batch)
+            if online_manager is not None
+            else contextlib.nullcontext()
+        )
+        with ctx_mgr, online_scope:
             mode_check = (
                 forward_batch.forward_mode.is_cpu_graph
                 if self.device == "cpu"
@@ -1872,6 +1888,7 @@ class ModelRunner:
             )
             can_run_graph = bool(
                 mode_check()
+                and not (online_manager is not None and online_manager.active)
                 and self.decode_cuda_graph_runner
                 and self.decode_cuda_graph_runner.can_run_graph(forward_batch)
             )

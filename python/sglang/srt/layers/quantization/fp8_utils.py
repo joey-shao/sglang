@@ -1704,12 +1704,17 @@ def quantize_block_fp8_weight_to_mxfp4(
     return fp4_weight, fp4_scale.contiguous().view(torch.float8_e8m0fnu)
 
 
-def requant_weight_ue8m0_inplace(weight, weight_scale_inv, weight_block_size):
+def requant_weight_ue8m0_inplace(
+    weight, weight_scale_inv, weight_block_size, *, reserved_experts: int = 0
+):
     assert isinstance(weight, torch.nn.Parameter)
     assert isinstance(weight_scale_inv, torch.nn.Parameter)
 
     new_weight, new_weight_scale_inv = requant_weight_ue8m0(
-        weight.to(weight_scale_inv.device), weight_scale_inv, weight_block_size
+        weight.to(weight_scale_inv.device),
+        weight_scale_inv,
+        weight_block_size,
+        reserved_experts=reserved_experts,
     )
 
     offloader.update_param(weight, new_weight)
@@ -1723,13 +1728,15 @@ def requant_block_scale_ue8m0_for_deepgemm(
     use_deepgemm_runner: bool,
     output_dtype: Optional[torch.dtype] = None,
     weight_shape=None,
+    reserved_experts: int = 0,
 ) -> bool:
     """Requantize block-FP8 weight scales to UE8M0 in place for DeepGEMM.
 
     No-op (returns False) unless the caller selected the DeepGEMM runner, the
     block size is 128x128 (the only layout the requant kernel supports), the
     scales are not already UE8M0, and DeepGEMM can run the layer (bf16 output,
-    aligned shape). Returns True when it requantizes.
+    aligned shape). Returns True when it requantizes. ``reserved_experts``
+    retains extra MoE capacity in the output storage without quantizing it.
     """
     from sglang.srt.model_loader.utils import should_deepgemm_weight_requant_ue8m0
 
@@ -1745,7 +1752,9 @@ def requant_block_scale_ue8m0_for_deepgemm(
     ):
         return False
 
-    requant_weight_ue8m0_inplace(weight, weight_scale, weight_block_size)
+    requant_weight_ue8m0_inplace(
+        weight, weight_scale, weight_block_size, reserved_experts=reserved_experts
+    )
     weight_scale.format_ue8m0 = True
     return True
 
@@ -1754,6 +1763,8 @@ def requant_weight_ue8m0(
     weight: torch.Tensor,
     weight_scale_inv: torch.Tensor,
     weight_block_size: List[int],
+    *,
+    reserved_experts: int = 0,
 ):
     assert weight_block_size == [128, 128]
 
@@ -1761,7 +1772,10 @@ def requant_weight_ue8m0(
     # 2D weights are a single matrix and fall through to the direct path below.
     if weight.dim() > 2:
         return _requant_weight_ue8m0_grouped(
-            weight, weight_scale_inv, weight_block_size
+            weight,
+            weight_scale_inv,
+            weight_block_size,
+            reserved_experts=reserved_experts,
         )
 
     *_, n, k = weight.shape
@@ -1787,7 +1801,11 @@ def _requant_weight_ue8m0_grouped(
     weight: torch.Tensor,
     weight_scale_inv: torch.Tensor,
     weight_block_size: List[int],
+    *,
+    reserved_experts: int = 0,
 ):
+    if reserved_experts and weight.dim() != 3:
+        raise ValueError("Reserved expert capacity requires 3D MoE weights")
     *group_dims, n, k = weight.shape
     w_groups = weight.reshape(-1, n, k)
     s_groups = weight_scale_inv.reshape(-1, *weight_scale_inv.shape[-2:])
@@ -1808,13 +1826,25 @@ def _requant_weight_ue8m0_grouped(
         )
         if out_w is None:
             out_w = torch.empty(
-                (num_groups, *w_g.shape), dtype=w_g.dtype, device=w_g.device
+                (num_groups + reserved_experts, *w_g.shape),
+                dtype=w_g.dtype,
+                device=w_g.device,
             )
             out_s = torch.empty(
-                (num_groups, *s_g.shape), dtype=s_g.dtype, device=s_g.device
+                (num_groups + reserved_experts, *s_g.shape),
+                dtype=s_g.dtype,
+                device=s_g.device,
             )
         out_w[g] = w_g
         out_s[g] = s_g
+
+    if reserved_experts:
+        # Only loaded masters are requantized. Allocate final packed scales for
+        # the full capacity, then return master views retaining that storage.
+        out_w[num_groups:].zero_()
+        out_s[num_groups:].fill_(1)
+        out_s = transform_scale_ue8m0(out_s, mn=n)
+        return out_w[:num_groups], out_s[:num_groups]
 
     out_w = out_w.view(*group_dims, n, k)
     out_s = out_s.view(*group_dims, *out_s.shape[-2:])

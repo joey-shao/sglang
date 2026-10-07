@@ -350,6 +350,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
     def forward_deepep(
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
     ) -> torch.Tensor:
+        dispatch_info = ExpertLocationDispatchInfo.init_new(layer_id=self.layer_id)
         if hidden_states.shape[0] > 0:
             # router_logits: (num_tokens, n_experts)
             router_logits, _ = self.gate(hidden_states)
@@ -357,12 +358,16 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
                 hidden_states,
                 router_logits,
                 num_token_non_padded=forward_batch.moe_num_token_non_padded(),
-                expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
-                    layer_id=self.layer_id,
-                ),
+                expert_location_dispatch_info=dispatch_info,
+                moe_layer=self.experts,
             )
         else:
-            topk_output = self.topk.empty_topk_output(hidden_states.device)
+            topk_output = self.topk.empty_topk_output(
+                hidden_states.device,
+                layer_id=self.layer_id,
+                expert_location_dispatch_info=dispatch_info,
+                moe_layer=self.experts,
+            )
         final_hidden_states = self.experts(
             hidden_states=hidden_states,
             topk_output=topk_output,

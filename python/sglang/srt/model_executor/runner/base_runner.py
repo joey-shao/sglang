@@ -51,6 +51,7 @@ from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
     get_flags,
+    get_global_online_eplb_manager,
     get_parallel,
 )
 from sglang.srt.speculative.spec_info import create_dummy_verify_input
@@ -734,12 +735,19 @@ class BaseRunner(ABC):
             if not mr.is_generation:
                 kwargs["get_embedding"] = True
 
-            logits_output_or_pp_proxy_tensors = mr.model.forward(
-                input_ids,
-                forward_batch.positions,
-                forward_batch,
-                **kwargs,
+            online_manager = get_global_online_eplb_manager()
+            online_scope = (
+                online_manager.forward_scope(forward_batch)
+                if online_manager is not None
+                else empty_context()
             )
+            with online_scope:
+                logits_output_or_pp_proxy_tensors = mr.model.forward(
+                    input_ids,
+                    forward_batch.positions,
+                    forward_batch,
+                    **kwargs,
+                )
             return logits_output_or_pp_proxy_tensors
 
         torch.get_device_module(mr.device).synchronize()

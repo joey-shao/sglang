@@ -45,6 +45,7 @@ except (ImportError, OSError) as exc:
     use_deepep_v2 = False
     _deepep_v2_import_error = exc
 
+
 class DeepEPv2DispatchOutput(NamedTuple):
     hidden_states: torch.Tensor
     hidden_states_scale: Optional[torch.Tensor]
@@ -260,6 +261,14 @@ class _DeepEPv2Impl:
     def _destroy_handle(self) -> None:
         self._handle = None
 
+    def _use_expand_layout(self) -> bool:
+        return not get_is_extend_in_batch()
+
+    def _dummy_topk_ids(self, topk_ids: torch.Tensor) -> torch.Tensor:
+        return torch.arange(
+            topk_ids.shape[-1], dtype=topk_ids.dtype, device=topk_ids.device
+        ).unsqueeze(0)
+
     def _get_buffer(self):
         return self.buffer_class.get_buffer(
             self.group,
@@ -308,7 +317,7 @@ class _DeepEPv2Impl:
         topk_ids = topk_output.topk_ids.to(torch.int64)
         self._validate_common(hidden_states, topk_ids)
         # Decode uses expanded/masked layout; extend uses contiguous in both modes.
-        use_expand_layout = not get_is_extend_in_batch()
+        use_expand_layout = self._use_expand_layout()
         use_masked = use_expand_layout
 
         # CPU-synced dispatch needs a dummy token to notify from an idle rank.
@@ -316,9 +325,7 @@ class _DeepEPv2Impl:
         if self._pad_empty_combine:
             hidden_states = hidden_states.new_zeros((1, hidden_states.shape[-1]))
             # Dummy routes need distinct expert ids; zero weights null the result.
-            topk_ids = torch.arange(
-                topk_ids.shape[-1], dtype=topk_ids.dtype, device=topk_ids.device
-            ).unsqueeze(0)
+            topk_ids = self._dummy_topk_ids(topk_ids)
             topk_weights = topk_weights.new_zeros((1, topk_weights.shape[-1]))
 
         if not self.use_fp8_dispatch:

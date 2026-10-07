@@ -1637,6 +1637,36 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             layer.w13_input_scale = None
             layer.w2_input_scale = None
 
+    def get_online_expert_weights(self, layer):
+        from sglang.srt.eplb.online_eplb_weight_prefetcher import ExpertWeightBundle
+
+        if (
+            not self.block_quant
+            or self.quant_config.weight_block_size != [128, 128]
+            or self.is_fp4_expert
+            or self.use_mxfp8
+        ):
+            raise ValueError("Online EPLB supports only 128x128 block-wise FP8 experts")
+        return ExpertWeightBundle.from_block_fp8(
+            layer.w13_weight,
+            layer.w2_weight,
+            layer.w13_weight_scale_inv,
+            layer.w2_weight_scale_inv,
+        )
+
+    def _update_online_expert_weight_views(self, layer):
+        """Expose full post-load storage without copying the master prefix."""
+        from sglang.srt.eplb.online_eplb_weight_prefetcher import ExpertWeightBundle
+
+        master = self.get_online_expert_weights(layer)
+        count = layer.num_local_experts + layer._online_eplb_slots
+        layer._online_expert_weights = ExpertWeightBundle(
+            *(
+                tensor.as_strided((count, *tensor.shape[1:]), tensor.stride())
+                for tensor in master.tensors()
+            )
+        )
+
     def create_weights(
         self,
         layer: Module,
@@ -1647,9 +1677,25 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         with_bias: bool = False,
         **extra_weight_attrs,
     ):
+        from sglang.srt.runtime_context import get_exec
+
+        slots = (
+            get_exec().moe.online_ep_redundant_slots_per_rank
+            if get_exec().moe.enable_online_eplb and not layer.is_shared_fused_moe
+            else 0
+        )
+        if slots and (
+            not self.block_quant
+            or self.quant_config.weight_block_size != [128, 128]
+            or not self.quant_config.is_checkpoint_fp8_serialized
+            or self.is_fp4_expert
+            or self.use_mxfp8
+        ):
+            raise ValueError("Online EPLB requires a 128x128 block-FP8 checkpoint")
+        layer._online_eplb_slots = slots
         Fp8MoEMethod.create_fp8_moe_weight_(
             layer=layer,
-            num_experts=num_experts,
+            num_experts=num_experts + slots,
             hidden_size=hidden_size,
             intermediate_size_per_partition=intermediate_size_per_partition,
             block_quant=self.block_quant,
@@ -1661,6 +1707,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             with_bias=with_bias,
             **extra_weight_attrs,
         )
+
+        if slots:
+            # Reserve M+R storage, but loaders and inactive forwards see only M.
+            for tensor in self.get_online_expert_weights(layer).tensors():
+                tensor.data[num_experts:].zero_()
+                tensor.data = tensor.data[:num_experts]
 
         if (
             not self.is_fp4_expert
@@ -2095,6 +2147,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                         use_deepgemm_runner=will_use_deepgemm,
                         output_dtype=torch.bfloat16,
                         weight_shape=weight.shape[-2:],
+                        reserved_experts=getattr(layer, "_online_eplb_slots", 0),
                     )
 
     def _convert_mxfp8_moe_to_block_fp8(self, layer: Module) -> None:
@@ -2421,8 +2474,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             self.process_weights_hip_int4(layer)
 
         elif self.block_quant:
-            # Block quant doesn't need to process weights after loading
             self.process_weights_after_loading_block_quant(layer)
+            if getattr(layer, "_online_eplb_slots", 0):
+                self._update_online_expert_weight_views(layer)
 
         # If checkpoint is fp16 or bfloat16, quantize in place.
         elif not self.quant_config.is_checkpoint_fp8_serialized:
@@ -3061,6 +3115,14 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     .unsqueeze(2)
                     .repeat_interleave(w2_scale_k, dim=2)
                 )
+            if layer._online_eplb_slots:
+                from sglang.srt.runtime_context import get_global_online_eplb_manager
+
+                manager = get_global_online_eplb_manager()
+                if manager.active:
+                    weights = layer._online_expert_weights
+                    w13_weight, w2_weight = weights.w13, weights.w2
+                    w13_scale, w2_scale = weights.w13_scale, weights.w2_scale
             quant_info = DeepGemmMoeQuantInfo(
                 w13_weight=w13_weight,
                 w2_weight=w2_weight,

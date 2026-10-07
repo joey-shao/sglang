@@ -12,25 +12,30 @@
 # limitations under the License.
 # ==============================================================================
 
+from __future__ import annotations
+
 from dataclasses import dataclass
-from typing import Literal, Optional
+from typing import TYPE_CHECKING, Literal, Optional
 
 import torch
 
 from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
-from sglang.srt.runtime_context import get_exec
+from sglang.srt.runtime_context import get_exec, get_global_online_eplb_manager
+
+if TYPE_CHECKING:
+    from sglang.srt.eplb.online_balancer import BalancePlan, OnlineExpertBalancer
 
 
 @dataclass
 class ExpertLocationDispatchInfo:
-    ep_dispatch_algorithm: Literal["static", "dynamic", "fake", "lp"]
+    ep_dispatch_algorithm: Literal["static", "dynamic", "fake", "lp", "online"]
     # (num_logical_experts,)
     partial_logical_to_rank_dispatch_physical_map: Optional[torch.Tensor]
     # (num_logical_experts, X)
-    partial_logical_to_all_physical_map: torch.Tensor
+    partial_logical_to_all_physical_map: Optional[torch.Tensor]
     # (num_logical_experts,)
-    partial_logical_to_all_physical_map_num_valid: torch.Tensor
-    num_physical_experts: int
+    partial_logical_to_all_physical_map_num_valid: Optional[torch.Tensor]
+    num_physical_experts: Optional[int]
     # Whether every rank must pick the same physical expert for a token. True
     # without an a2a backend: all EP ranks then run the MoE over the same tokens
     # and sum their partial outputs, so a rank-dependent pick counts a replicated
@@ -40,6 +45,15 @@ class ExpertLocationDispatchInfo:
 
     @classmethod
     def init_new(cls, layer_id: int):
+        if get_exec().moe.enable_online_eplb:
+            # Online placement belongs to the current call, not static metadata.
+            return cls(
+                ep_dispatch_algorithm="online",
+                partial_logical_to_rank_dispatch_physical_map=None,
+                partial_logical_to_all_physical_map=None,
+                partial_logical_to_all_physical_map_num_valid=None,
+                num_physical_experts=None,
+            )
         ep_dispatch_algorithm = get_exec().moe.ep_dispatch_algorithm
         expert_location_metadata = get_global_expert_location_metadata()
         assert expert_location_metadata is not None
@@ -84,10 +98,19 @@ def topk_ids_logical_to_physical(
     topk_ids: torch.Tensor,
     info: Optional[ExpertLocationDispatchInfo],
     log2phy_prob: Optional[torch.Tensor] = None,
+    *,
+    online_plan: Optional[BalancePlan] = None,
 ) -> torch.Tensor:
     if info is None:
         return topk_ids
 
+    if info.ep_dispatch_algorithm == "online":
+        manager = get_global_online_eplb_manager()
+        if online_plan is None:
+            return manager.balancer.master_ids(topk_ids)
+        return _topk_ids_logical_to_physical_online(
+            topk_ids, online_plan, manager.balancer
+        )
     if info.ep_dispatch_algorithm == "static":
         return _topk_ids_logical_to_physical_static(topk_ids, info)
     if info.ep_dispatch_algorithm in ["dynamic", "fake"]:
@@ -100,6 +123,32 @@ def topk_ids_logical_to_physical(
             )
         return _topk_ids_logical_to_physical_probability(topk_ids, info, log2phy_prob)
     raise NotImplementedError(f"Unknown algorithm {info.ep_dispatch_algorithm}")
+
+
+def _topk_ids_logical_to_physical_online(
+    topk_ids: torch.Tensor, plan: BalancePlan, balancer: OnlineExpertBalancer
+):
+    physical = balancer.master_ids(topk_ids)
+    if plan.transfers and topk_ids.numel():
+        ids = topk_ids.reshape(-1).to(torch.int64)
+        valid = (ids >= 0) & (ids < balancer.num_experts)
+        safe = ids.clamp(0, balancer.num_experts - 1)
+        # Stable grouping preserves (token, top-k column) order within experts.
+        order = torch.argsort(ids, stable=True)
+        sorted_ids = ids[order]
+        position = torch.arange(ids.numel(), device=ids.device)
+        starts = torch.ones_like(sorted_ids, dtype=torch.bool)
+        starts[1:] = sorted_ids[1:] != sorted_ids[:-1]
+        group_start = torch.where(starts, position, 0).cummax(dim=0).values
+        local_ordinal = torch.empty_like(position)
+        local_ordinal.scatter_(0, order, position - group_start)
+        ordinal = local_ordinal + plan.source_prefix[safe]
+        routed = physical.reshape(-1)
+        for expert, target, start, end in plan.transfers:
+            selected = valid & (ids == expert) & (ordinal >= start) & (ordinal < end)
+            routed = torch.where(selected, target, routed)
+        physical = routed.reshape_as(topk_ids)
+    return physical
 
 
 def _topk_ids_logical_to_physical_static(

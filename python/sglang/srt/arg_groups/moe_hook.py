@@ -252,6 +252,7 @@ def handle_a2a_moe(server_args: Any):
     run_post_process_pass(server_args, _a2a_fusion_adjustments)
 
     a2a_backend = resolved_view(server_args).moe_a2a_backend
+    validate_online_expert_balancing(server_args)
     if cfg.enable_waterfill:
         declare_resolution(
             server_args, "_handle_a2a_moe", enforce_shared_experts_fusion=True
@@ -374,8 +375,8 @@ def handle_a2a_moe(server_args: Any):
         logger.warning(
             "%s MoE is using deepep_v2_mode=%s. This controls "
             "DeepEP v2/v2.5 direct/hybrid mode and is independent from "
-            "--deepep-mode normal/low_latency. This backend enables the "
-            "decode CUDA graph on the masked decode path (any comm mode) "
+            "--deepep-mode normal/low_latency. "
+            "this backend supports decode CUDA graphs on the masked path "
             "and disables shared expert fusion. "
             "SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK is a "
             "per-rank communication buffer capacity, not a model limit; "
@@ -526,6 +527,67 @@ def handle_a2a_moe(server_args: Any):
                 "must be >= the per-rank pplx dispatch tokens "
                 "(chunked_prefill_size, or the decode cuda-graph batch size)"
             )
+
+
+def validate_online_expert_balancing(server_args: Any) -> None:
+    """Qwen3 MoE uses eager block-FP8 prefill and master-only decode graphs."""
+    cfg = resolved_view(server_args)
+    if not cfg.enable_online_eplb:
+        return
+    architecture = model_config_of(server_args).hf_config.architectures[0]
+    if architecture != "Qwen3MoeForCausalLM":
+        raise ValueError(
+            "--enable_online_eplb only supports Qwen3MoeForCausalLM, "
+            f"got {architecture}."
+        )
+    if cfg.moe_a2a_backend != "deepep_v2.5":
+        raise ValueError("--enable_online_eplb requires --moe-a2a-backend deepep_v2.5")
+    if (
+        cfg.online_ep_redundant_slots_per_rank <= 0
+        or cfg.online_ep_min_tokens_per_replica <= 0
+        or cfg.online_ep_min_forward_tokens <= 0
+    ):
+        raise ValueError(
+            "Online EP requires positive replica capacity and token threshold"
+        )
+    incompatible = {
+        "enable_eplb": cfg.enable_eplb,
+        # Static recorder tables do not describe invocation-local replicas.
+        "expert_distribution_recorder_mode": cfg.expert_distribution_recorder_mode
+        is not None,
+        "ep_num_redundant_experts": cfg.ep_num_redundant_experts != 0,
+        "init_expert_location": cfg.init_expert_location != "trivial",
+        "ep_dispatch_algorithm": cfg.ep_dispatch_algorithm not in (None, "static"),
+        "elastic_ep_backend": cfg.elastic_ep_backend is not None,
+        "elastic_ep_initial_size": cfg.elastic_ep_initial_size is not None,
+        "ep_join_mode": cfg.ep_join_mode is not None,
+        "enable_lora": cfg.enable_lora,
+        "enable_memory_saver": cfg.enable_memory_saver,
+        "enable_torch_compile": cfg.enable_torch_compile,
+        "dwdp_size": cfg.dwdp_size != 1,
+        "moe_dp_size": cfg.moe_dp_size != 1,
+        # None allows checkpoint metadata to select FP8 automatically. The
+        # manager validates the actual Fp8MoEMethod after model loading.
+        "quantization": cfg.quantization not in (None, "fp8"),
+        "enable_two_batch_overlap": cfg.enable_two_batch_overlap,
+        "enable_single_batch_overlap": cfg.enable_single_batch_overlap,
+        "enable_waterfill": cfg.enable_waterfill,
+        "enforce_shared_experts_fusion": cfg.enforce_shared_experts_fusion,
+        "speculative_algorithm": cfg.speculative_algorithm is not None,
+    }
+    unsupported = [name for name, enabled in incompatible.items() if enabled]
+    if unsupported:
+        raise ValueError(f"Online EP does not support: {', '.join(unsupported)}")
+    if cfg.deepep_v2_mode != "direct" or cfg.tp_size < 2:
+        raise ValueError("Online EP requires direct mode with at least two EP ranks")
+    # The CPU reference planner and contiguous pre-permute use host counts.
+    graph_config = with_phase(
+        cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
+    )
+    declare_resolution(server_args, "_handle_a2a_moe", cuda_graph_config=graph_config)
+    logger.warning(
+        "Online EP uses eager block-FP8 prefill balancing; decode uses master-only CUDA graphs when configured."
+    )
 
 
 def validate_deepep_v2_speculative_draft(server_args: Any) -> None:

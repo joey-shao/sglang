@@ -1621,6 +1621,18 @@ def set_global_dwdp_manager(manager: Any) -> None:
     _GLOBAL_DWDP_MANAGER = manager
 
 
+_GLOBAL_ONLINE_EPLB_MANAGER: Any = None
+
+
+def get_global_online_eplb_manager() -> Any:
+    return _GLOBAL_ONLINE_EPLB_MANAGER
+
+
+def set_global_online_eplb_manager(manager: Any) -> None:
+    global _GLOBAL_ONLINE_EPLB_MANAGER
+    _GLOBAL_ONLINE_EPLB_MANAGER = manager
+
+
 def _group_leaves(group: _FlagGroupBase) -> dict[str, Any]:
     """The leaf values of a flag group, recursively."""
     leaves: dict[str, Any] = {}
@@ -1675,11 +1687,15 @@ def snapshot_context() -> dict[str, Any]:
         for name in type(_CONTEXT.parallel).__slots__
     }
     state["__dwdp__"] = get_global_dwdp_manager()
+    state["__online_eplb__"] = get_global_online_eplb_manager()
     return state
 
 
 def restore_context(state: dict[str, Any]) -> None:
     """Put back what ``snapshot_context`` captured."""
+    online_manager = get_global_online_eplb_manager()
+    if online_manager is not None and online_manager is not state["__online_eplb__"]:
+        online_manager.cleanup()
     for name in RuntimeContext.__slots__:
         if name == "parallel":
             continue
@@ -1693,6 +1709,7 @@ def restore_context(state: dict[str, Any]) -> None:
     for name, value in state["__parallel__"].items():
         setattr(_CONTEXT.parallel, name, value)
     set_global_dwdp_manager(state["__dwdp__"])
+    set_global_online_eplb_manager(state["__online_eplb__"])
 
 
 def reset_context() -> None:
@@ -1700,6 +1717,9 @@ def reset_context() -> None:
 
     Used for test teardown and runtime lifecycle reset.
     """
+    online_manager = get_global_online_eplb_manager()
+    if online_manager is not None:
+        online_manager.cleanup()
     _CONTEXT._server_args = None
     _CONTEXT._config_bags = None
     _CONTEXT._overrides_log = []
@@ -1710,6 +1730,7 @@ def reset_context() -> None:
     _CONTEXT.resources = Resources()
     _CONTEXT.forward = ForwardFlags()
     set_global_dwdp_manager(None)
+    set_global_online_eplb_manager(None)
 
 
 def remote_instance_transfer_engine_enabled(load_format: str | None = None) -> bool:

@@ -735,7 +735,7 @@ class ExecMoe(msgspec.Struct):
                 "flashinfer",
                 "megamoe",
                 "deepep_v2",
-            "deepep_v2.5",
+                "deepep_v2.5",
                 "pplx",
                 "ascend_tp",
                 "flashinfer_megamoe",
@@ -790,6 +790,23 @@ class ExecMoe(msgspec.Struct):
     ep_num_redundant_experts: A[
         int, "Allocate this number of redundant experts in expert parallel."
     ] = 0
+    enable_online_eplb: A[
+        bool,
+        Arg(
+            help="Experimental per-layer online expert replication with deepep_v2.5. "
+            "Supports single-NVLink-domain BF16/block-FP8 prefill balancing and master-only decode graphs.",
+            cli_name="--enable_online_eplb",
+        ),
+    ] = False
+    online_ep_redundant_slots_per_rank: A[
+        int, "Number of cross-layer shared replica slots per rank for online EP."
+    ] = 4
+    online_ep_min_forward_tokens: A[
+        int, "Minimum global unpadded prefill tokens to activate online EP balancing."
+    ] = 1
+    online_ep_min_tokens_per_replica: A[
+        int, "Minimum token quota moved to a replica by the online EP planner."
+    ] = 1
     ep_dispatch_algorithm: A[
         Optional[Literal["static", "dynamic", "fake", "lp"]],
         "The algorithm to choose ranks for redundant experts in expert parallel.",
