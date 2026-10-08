@@ -8,7 +8,8 @@ import torch
 
 from sglang.kernels.jit.utils import cache_once, load_jit, make_cpp_args
 
-ONLINE_EPLB_BLOCK_SIZE = 256
+ONLINE_EPLB_ROUTE_THREADS_PER_BLOCK = 256
+ONLINE_EPLB_PLAN_THREADS_PER_BLOCK = 128
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -17,22 +18,31 @@ if TYPE_CHECKING:
 
 
 @cache_once
-def _jit_online_eplb_module(dtype: torch.dtype) -> Module:
+def _jit_online_eplb_module(
+    dtype: torch.dtype, plan_block_size: int = ONLINE_EPLB_PLAN_THREADS_PER_BLOCK
+) -> Module:
     if dtype not in (torch.int32, torch.int64):
         raise ValueError(f"Online EPLB IDs must be int32 or int64, got {dtype}")
+    if plan_block_size not in (32, 64, 128):
+        raise ValueError("Online EPLB plan block size must be 32, 64 or 128")
     args = make_cpp_args(dtype)
-    # No PDL: each stage consumes the preceding kernel's completed writes.
+    planner = f"OnlineEplbPlanKernel<{plan_block_size}>"
+    # No PDL: the planner must finish before downstream consumers read its output.
     return load_jit(
         "moe_online_eplb",
         *args,
-        str(ONLINE_EPLB_BLOCK_SIZE),
+        str(ONLINE_EPLB_ROUTE_THREADS_PER_BLOCK),
+        str(plan_block_size),
         cuda_files=["moe/online_eplb_route.cuh", "moe/online_eplb_plan.cuh"],
-        extra_cuda_cflags=[f"-DONLINE_EPLB_BLOCK_SIZE={ONLINE_EPLB_BLOCK_SIZE}"],
+        extra_cuda_cflags=[
+            "-DONLINE_EPLB_ROUTE_THREADS_PER_BLOCK="
+            f"{ONLINE_EPLB_ROUTE_THREADS_PER_BLOCK}"
+        ],
         cuda_wrappers=[
             ("histogram", f"OnlineEplbRouteKernel<{args}>::histogram"),
             ("prefix", f"OnlineEplbRouteKernel<{args}>::prefix"),
             ("remap", f"OnlineEplbRouteKernel<{args}>::remap"),
-            ("plan", "OnlineEplbPlanKernel::run"),
+            ("plan", f"{planner}::run"),
         ],
     )
 
@@ -46,7 +56,7 @@ def prepare_counts(
     """Write counts and exclusive tile prefixes for contiguous flattened IDs.
 
     Tile buffers have shape
-    [max(1, ceil(ids.numel() / ONLINE_EPLB_BLOCK_SIZE)), experts].
+    [max(1, ceil(ids.numel() / ONLINE_EPLB_ROUTE_THREADS_PER_BLOCK)), experts].
     Invalid IDs contribute nothing. Retain block_prefix until remap completes.
     """
     module = _jit_online_eplb_module(ids.dtype)
@@ -59,9 +69,10 @@ def plan(
     rank: int,
     min_quota: int,
     plan: BalancePlan,
+    block_size: int = ONLINE_EPLB_PLAN_THREADS_PER_BLOCK,
 ) -> None:
     """Fill the plan's preallocated tensors without reading device results back."""
-    _jit_online_eplb_module(torch.int32).plan(
+    _jit_online_eplb_module(torch.int32, block_size).plan(
         counts,
         plan.redundancy_mapping,
         plan.instance_physical_ids,

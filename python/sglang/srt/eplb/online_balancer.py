@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import torch
 
-from sglang.kernels.ops.moe.online_eplb import ONLINE_EPLB_BLOCK_SIZE
+from sglang.kernels.ops.moe.online_eplb import ONLINE_EPLB_ROUTE_THREADS_PER_BLOCK
 from sglang.kernels.ops.moe.online_eplb import plan as device_plan
 from sglang.kernels.ops.moe.online_eplb import prepare_counts as device_prepare_counts
 from sglang.kernels.ops.moe.online_eplb import remap as device_remap
@@ -78,8 +78,8 @@ class OnlineExpertBalancer:
         self.max_routing_entries = max_routing_entries
 
         blocks = (
-            max_routing_entries + ONLINE_EPLB_BLOCK_SIZE - 1
-        ) // ONLINE_EPLB_BLOCK_SIZE
+            max_routing_entries + ONLINE_EPLB_ROUTE_THREADS_PER_BLOCK - 1
+        ) // ONLINE_EPLB_ROUTE_THREADS_PER_BLOCK
         # The runner selects the current CUDA device; bare torch.empty still
         # defaults to CPU unless a separate default-device context is active.
         self.block_counts = torch.empty(
@@ -118,8 +118,8 @@ class OnlineExpertBalancer:
     def prepare_local_counts(self, logical_ids: torch.Tensor) -> None:
         blocks = max(
             1,
-            (logical_ids.numel() + ONLINE_EPLB_BLOCK_SIZE - 1)
-            // ONLINE_EPLB_BLOCK_SIZE,
+            (logical_ids.numel() + ONLINE_EPLB_ROUTE_THREADS_PER_BLOCK - 1)
+            // ONLINE_EPLB_ROUTE_THREADS_PER_BLOCK,
         )
         self._active_prefix = self.block_prefix[:blocks]
         device_prepare_counts(

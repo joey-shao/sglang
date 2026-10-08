@@ -151,13 +151,13 @@ flowchart TD
     H --> I[Existing dispatch / DeepGEMM / combine]
 ```
 
-目标是每层 **4 个本地自定义 kernel + 1 次现有 counts collective**，不含既有 padding mask、prefetch 和 MoE kernels。实现若需要额外固定次数的 memset/scan，应在 benchmark 中如实计入；不能把子操作排除来宣称只有一次 launch。
+planner 单次 launch 内分为三个逻辑阶段，每层为 **4 个本地自定义 kernel + 1 次现有 counts collective**，不含既有 padding mask、prefetch 和 MoE kernels。实现若需要额外固定次数的 memset/scan，应在 benchmark 中如实计入；不能把子操作排除来宣称只有一次 launch。
 
 K1/K2 同时为 counts 和稳定 ordinal 提供数据，避免 histogram 和 remap 分别重做一套通用排序。
 
 ### 7.1 K1：分块 histogram
 
-tile 大小由 Python wrapper 中的 `ONLINE_EPLB_BLOCK_SIZE=256` 统一定义，并通过 JIT 的同名编译宏传给 CUDA。Python workspace 分块、K1/K4 的 block 大小和 K4 warp histogram 容量均由它推导；该值也参与 JIT 缓存标识。
+tile 大小由 Python wrapper 中的 `ONLINE_EPLB_ROUTE_THREADS_PER_BLOCK=256` 统一定义，并通过 JIT 的同名编译宏传给 CUDA。Python workspace 分块、K1/K4 的 block 大小和 K4 warp histogram 容量均由它推导；该值也参与 JIT 缓存标识。
 
 每 block 处理固定 256 个按 row-major 展开的 top-k entries，在共享内存统计 E 个 bins，完整写出本 tile 的 block counts。只统计 `0 <= id < E` 的 entries；padding -1 不索引 histogram、不贡献 ordinal。
 
@@ -182,9 +182,17 @@ local_counts[e]   = sum_b block_counts[b,e]
 
 ### 7.4 K3：GPU quota solver
 
-首版使用 JIT CUDA 单 CTA、128 threads、4 warps，每 rank 对同一 C 独立求解。规模小、整数控制流较多，CUDA warp reduction 和 shared-memory state 更接近 UltraEP 现有实现；不先引入大型库依赖。一个 CTA 的目的在于降低延迟和同步复杂度，不以占满全部 SM 为目标。
+K3 保持单次 `online_eplb_plan_kernel` launch，在 kernel 内划分 Prologue、PlanVerifyAndScore、Epilogue 三个逻辑阶段。固定使用单 CTA（`grid.x = 1`），默认 128 threads；内部接口支持 32/64/128 threads 的 block 配置，尚无 GPU 性能实测。
 
-K3 执行 global counts/source prefix、初始化、候选阈值求解、best plan 选择及输出 materialization。首版由一个 warp 执行有依赖的 greedy 控制循环，四个 warps 协作完成计数、排序索引和输出；候选阈值顺序试探，不并行运行多个共享可写 candidate。阶段交接使用 CTA barrier。后续若并行试探，必须为每个 warp 提供独立 candidate scratch。
+Prologue 只计算 global counts/source prefix、稳定排序索引和初始 loads。`online_eplb_plan_kernel` 在 Prologue 之后初始化 CTA 级 `SearchState`，并控制后续搜索轮次。空负载或初始负载已均衡时直接进入 Epilogue，输出 master-only。
+
+PlanVerifyAndScore 每轮由 CTA controller 生成最多 `block.x / 32` 个不同阈值，各 warp 只执行一次 `try_plan`。第 0 轮的 warp 0 采用原快路径阈值 `first=min(UB-1, ceil(101*LB/100))`；默认其余三个 warp 同时试探 `[first, UB-1]` 跨度的 1/8、1/4、1/2 位置。整数舍入导致重复时向后调整为不同阈值，窄区间仅启用实际需要的 warp。包括第 0 轮在内，所有轮次都统一调用 `score_round`；本轮所有成功结果均参与评分，并共同收紧下一轮搜索范围，warp 0 不享有优先选择或无条件 early stop。
+
+后续轮次在当前共同区间均匀选点；区间长度不超过 warp 数时一次枚举所有整数阈值。总预算固定为最多 16 个候选，包含第 0 轮原快路径和推测候选。128 threads 最多 4 轮，64 threads 最多 8 轮，32 threads 最多 16 轮。所有 warp 共享这份预算，不再各自执行独立搜索循环。
+
+`WarpWorkspace` 只保留临时候选及 success 标记，CTA 只保留一个 `SearchState::best`。每轮等待全部 warp 验证完成，再按原有评分顺序归约，最多复制一次本轮 winner；复制结束后通过 CTA barrier 开始下一轮。Epilogue 直接消费 CTA 的 best。保留成功候选的 canonical export 排序和原有评分。统一评分后的 best 若满足 `max_load <= good_threshold=ceil(101*LB/100)` 且副本总数 `count <= kMaxEarlyStopReplicas`，则提前结束；副本成本暂按全 EP 新增副本数量衡量，内部阈值默认为 1。仅检查最终选中的 best，避免某个便宜候选触发停止却返回另一份高成本计划。该阈值只控制 early stop，不是输出方案的副本硬上限。
+
+规划过程只使用共享内存 scratch，不需要全局搜索工作区或额外 launch。每轮仍需等待全部有效 warp 完成，因此并行试探不保证近理想候选命中时的延迟一定下降；实际 solver 延迟、寄存器/spill 和方案质量需要 CUDA 实测。
 
 候选采用最多 P×R 条 `(expert,target,quota)` 的稀疏 export 表，不在共享内存里为每次试探复制整个 `[E,P]` 输出。remaining counts、rank state 和 occupied bitset 使用固定上界的 scratch；完整输出只在最后 materialize。实施需记录寄存器、spill 和 shared-memory 用量，不能以逻辑上“一个 kernel”掩盖严重 spill。
 
@@ -220,31 +228,34 @@ K3 执行 global counts/source prefix、初始化、候选阈值求解、best pl
 
 数学下界 `LB=ceil(N/P)`；全 master 上界 `UB=max(L0)`。N=0、LB=UB 等明显无收益情况在 GPU 内直接输出 master-only。
 
-先试接近理想负载的阈值 `min(UB-1, ceil(101*LB/100))`，成功即可结束 fast path；1% 是初始工程容差而非硬件成本模型。若未找到计划，在更宽松的区间作有界中点试探；保存每一个成功 candidate，按 8.1 选择实际效果最好的计划。最多 16 次 threshold evaluations，均在单 kernel 内执行；UB 的 master-only 计划始终是合法退路。
+第 0 轮将原来的近理想阈值与其他推测阈值并行验证。每轮均统一选择最佳候选；只有 best 达到近理想负载且复制成本足够低时，才触发成本相关的 early stop。搜索下界初始化为 LB，让近理想候选复制成本过高时仍可搜索更低阈值；区间耗尽和预算耗尽仍是正常终止条件。总预算最多 16 次 `try_plan`，不论 block 中有多少 warp。UB 的 master-only 计划始终是合法退路。
 
 ```text
 best = master_only
 if N == 0 or LB == UB:
     return best
-t0 = min(UB - 1, ceil(101 * LB / 100))
-p = try_plan(t0)
-if p.success:
-    return p
-
-lo, hi = t0 + 1, UB - 1
-repeat at most 15 times:
-    if lo > hi: break
-    t = lo + (hi - lo) // 2
-    p = try_plan(t)
-    if p.success:
-        best = better(best, p)
-        hi = min(t - 1, actual_max_load(p) - 1)
-    else:
-        lo = t + 1
+lo = LB
+hi = UB - 1
+good_threshold = ceil(101 * LB / 100)
+first = min(hi, good_threshold)
+W = block.x / 32
+evaluations = 0
+repeat at most ceil(16 / W) rounds:
+    base = first if first_round else lo
+    active = min(W, hi - base + 1, 16 - evaluations)
+    thresholds = distinct_thresholds(first if first_round else lo, hi, active, first_round)
+    parallel for warp in [0, active):
+        candidates[warp] = try_plan(thresholds[warp])
+    evaluations += active
+    best = deterministic_best(best, successful_candidates)
+    hi = min(hi, each_successful_threshold - 1, each_successful_actual_max_load - 1)
+    lo = max(lo, each_failed_threshold_at_or_below_hi + 1)
+    if best.max_load <= good_threshold and best.count <= 1: break
+    if lo > hi or evaluations == 16: break
 return best
 ```
 
-构造式 greedy 的失败不等于数学不可行，成功/失败也不保证具有精确 oracle 的单调性。因此中点试探仅用于有界 heuristic refinement：失败后放弃部分区间可能错过更好解，不得称为精确二分最优。实施时用小规模穷举/整数参考估计 quality gap，记录相对 LB、旧 greedy 和 UltraEP 的最大负载；若质量不达标再改进候选集合，而不是隐藏失败。
+成功候选优先收紧共同上界，再使用不超过新上界的失败阈值提高下界，避免较高阈值失败抹掉较低成功候选留下的搜索区间。构造式 greedy 的失败不等于数学不可行，成功/失败也不保证具有精确 oracle 的单调性，因此该范围更新仍是有界启发式，可能错过更好解。并行批次与旧的逐次试探会访问不同候选；保证合法性和确定性，不再保证原快路径或 fallback 方案与旧实现完全一致，也不保证方案质量总是更好。性能比较应保持 16 候选预算一致，并报告最大负载、副本数及迁移量。
 
 候选求解只处理设备计数。设备回退不得触发 host 读取或改变 collective 次序。
 
@@ -337,7 +348,7 @@ host 上的统一 `active=False`（decode/原有 token 门槛）仍可在进入�
 
 仅支持 GPU planner，启用 `enable_online_eplb` 后直接使用，不提供 planner backend 选择参数。删除 CPU planner、CPU reference 和回滚 adapter；超出支持范围时初始化报错。
 
-不新增 public epsilon、kernel-stage 或 locality 开关。1% 初始目标和最多 16 次 evaluation 是固定的内部策略。当前默认值为 R=2、min-forward-tokens=4096、Qmin=1024；比较性能时显式对齐这些参数。
+不新增 public epsilon、kernel-stage 或 locality 开关。1% 初始目标和整个 CTA 最多 16 次 candidate evaluation 是固定的内部策略。当前默认值为 R=2、min-forward-tokens=4096、Qmin=1024；比较性能时显式对齐这些参数。
 
 ## 12. 文件组织
 

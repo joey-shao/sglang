@@ -11,16 +11,16 @@
 #include <climits>
 #include <cstdint>
 
-#ifndef ONLINE_EPLB_BLOCK_SIZE
-#error "ONLINE_EPLB_BLOCK_SIZE must be provided by the online EPLB JIT wrapper"
+#ifndef ONLINE_EPLB_ROUTE_THREADS_PER_BLOCK
+#error "ONLINE_EPLB_ROUTE_THREADS_PER_BLOCK must be provided by the online EPLB JIT wrapper"
 #endif
 
 namespace sglang {
 
 static_assert(
-    ONLINE_EPLB_BLOCK_SIZE >= device::kWarpThreads && ONLINE_EPLB_BLOCK_SIZE <= 1024 &&
-    ONLINE_EPLB_BLOCK_SIZE % device::kWarpThreads == 0);
-inline constexpr uint32_t kOnlineEplbNumWarps = ONLINE_EPLB_BLOCK_SIZE / device::kWarpThreads;
+    ONLINE_EPLB_ROUTE_THREADS_PER_BLOCK >= device::kWarpThreads && ONLINE_EPLB_ROUTE_THREADS_PER_BLOCK <= 1024 &&
+    ONLINE_EPLB_ROUTE_THREADS_PER_BLOCK % device::kWarpThreads == 0);
+inline constexpr uint32_t kOnlineEplbNumWarps = ONLINE_EPLB_ROUTE_THREADS_PER_BLOCK / device::kWarpThreads;
 
 template <typename IdT>
 __global__ void online_eplb_histogram_kernel(
@@ -93,8 +93,7 @@ __global__ void online_eplb_remap_kernel(
   // All 32 lanes participate, including invalid IDs and the partial-tile tail.
   // One leader writes the histogram for each (warp, expert) peer group.
   const uint32_t peers = __match_any_sync(0xffffffffu, e);
-  if (valid && lane == static_cast<uint32_t>(__ffs(peers) - 1)) 
-    warp_counts[warp * num_experts + e] = __popc(peers);
+  if (valid && lane == static_cast<uint32_t>(__ffs(peers) - 1)) warp_counts[warp * num_experts + e] = __popc(peers);
   __syncthreads();
 
   if (i >= n) return;
@@ -135,7 +134,10 @@ struct OnlineEplbRouteKernel {
         .verify(block_counts);
 
     LaunchKernel(
-        static_cast<uint32_t>(blocks.unwrap()), ONLINE_EPLB_BLOCK_SIZE, device.unwrap(), num_experts * sizeof(int32_t))(
+        static_cast<uint32_t>(blocks.unwrap()),
+        ONLINE_EPLB_ROUTE_THREADS_PER_BLOCK,
+        device.unwrap(),
+        num_experts * sizeof(int32_t))(
         online_eplb_histogram_kernel<IdT>,
         static_cast<const IdT*>(ids.data_ptr()),
         static_cast<int32_t*>(block_counts.data_ptr()),
@@ -200,7 +202,8 @@ struct OnlineEplbRouteKernel {
         .verify(physical_ids);
 
     const uint32_t count = static_cast<uint32_t>(n.unwrap());
-    const uint32_t blocks = std::max<uint32_t>(1, (count + ONLINE_EPLB_BLOCK_SIZE - 1) / ONLINE_EPLB_BLOCK_SIZE);
+    const uint32_t blocks =
+        std::max<uint32_t>(1, (count + ONLINE_EPLB_ROUTE_THREADS_PER_BLOCK - 1) / ONLINE_EPLB_ROUTE_THREADS_PER_BLOCK);
     TensorMatcher({static_cast<int64_t>(blocks), static_cast<int64_t>(num_experts)})
         .with_dtype<int32_t>()
         .with_device(device)
@@ -208,7 +211,11 @@ struct OnlineEplbRouteKernel {
 
     if (count == 0) return;
 
-    LaunchKernel(blocks, ONLINE_EPLB_BLOCK_SIZE, device.unwrap(), kOnlineEplbNumWarps * num_experts * sizeof(int32_t))(
+    LaunchKernel(
+        blocks,
+        ONLINE_EPLB_ROUTE_THREADS_PER_BLOCK,
+        device.unwrap(),
+        kOnlineEplbNumWarps * num_experts * sizeof(int32_t))(
         online_eplb_remap_kernel<IdT>,
         static_cast<const IdT*>(ids.data_ptr()),
         static_cast<int64_t*>(out.data_ptr()),
