@@ -14,20 +14,19 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal, Optional
 
+import msgspec
 import torch
 
 from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
 from sglang.srt.runtime_context import get_exec, get_global_online_eplb_manager
 
 if TYPE_CHECKING:
-    from sglang.srt.eplb.online_balancer import BalancePlan, OnlineExpertBalancer
+    from sglang.srt.eplb.online_balancer import BalancePlan
 
 
-@dataclass
-class ExpertLocationDispatchInfo:
+class ExpertLocationDispatchInfo(msgspec.Struct):
     ep_dispatch_algorithm: Literal["static", "dynamic", "fake", "lp", "online"]
     # (num_logical_experts,)
     partial_logical_to_rank_dispatch_physical_map: Optional[torch.Tensor]
@@ -108,9 +107,7 @@ def topk_ids_logical_to_physical(
         manager = get_global_online_eplb_manager()
         if online_plan is None:
             return manager.balancer.master_ids(topk_ids)
-        return _topk_ids_logical_to_physical_online(
-            topk_ids, online_plan, manager.balancer
-        )
+        return manager.balancer.remap(topk_ids, online_plan)
     if info.ep_dispatch_algorithm == "static":
         return _topk_ids_logical_to_physical_static(topk_ids, info)
     if info.ep_dispatch_algorithm in ["dynamic", "fake"]:
@@ -123,32 +120,6 @@ def topk_ids_logical_to_physical(
             )
         return _topk_ids_logical_to_physical_probability(topk_ids, info, log2phy_prob)
     raise NotImplementedError(f"Unknown algorithm {info.ep_dispatch_algorithm}")
-
-
-def _topk_ids_logical_to_physical_online(
-    topk_ids: torch.Tensor, plan: BalancePlan, balancer: OnlineExpertBalancer
-):
-    physical = balancer.master_ids(topk_ids)
-    if plan.transfers and topk_ids.numel():
-        ids = topk_ids.reshape(-1).to(torch.int64)
-        valid = (ids >= 0) & (ids < balancer.num_experts)
-        safe = ids.clamp(0, balancer.num_experts - 1)
-        # Stable grouping preserves (token, top-k column) order within experts.
-        order = torch.argsort(ids, stable=True)
-        sorted_ids = ids[order]
-        position = torch.arange(ids.numel(), device=ids.device)
-        starts = torch.ones_like(sorted_ids, dtype=torch.bool)
-        starts[1:] = sorted_ids[1:] != sorted_ids[:-1]
-        group_start = torch.where(starts, position, 0).cummax(dim=0).values
-        local_ordinal = torch.empty_like(position)
-        local_ordinal.scatter_(0, order, position - group_start)
-        ordinal = local_ordinal + plan.source_prefix[safe]
-        routed = physical.reshape(-1)
-        for expert, target, start, end in plan.transfers:
-            selected = valid & (ids == expert) & (ordinal >= start) & (ordinal < end)
-            routed = torch.where(selected, target, routed)
-        physical = routed.reshape_as(topk_ids)
-    return physical
 
 
 def _topk_ids_logical_to_physical_static(

@@ -72,6 +72,20 @@ register_kernel(
 )
 
 
+for _fn in ("prepare_counts", "plan", "remap"):
+    register_kernel(
+        KernelSpec(
+            op=f"moe.online_eplb_{_fn}",
+            backend=KernelBackend.JIT,
+            target=f"sglang.kernels.ops.moe.online_eplb:{_fn}",
+            capabilities=_CUDA,
+            format_signature=FormatSignature(in_place=True),
+            description="Online EPLB GPU counting, quota planning and ordinal remap.",
+        )
+    )
+del _fn
+
+
 def moe_align_block_size(
     topk_ids: torch.Tensor,
     num_experts: int,

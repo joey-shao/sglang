@@ -26,6 +26,7 @@ class OnlineEplbManager:
         self.active = False
         self.ep_group = None
 
+        from sglang.srt.environ import envs
         from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
         from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
         from sglang.srt.runtime_context import get_exec, get_parallel
@@ -50,6 +51,8 @@ class OnlineEplbManager:
             layers[0].num_global_routed_experts,
             cfg.online_ep_redundant_slots_per_rank,
             cfg.online_ep_min_tokens_per_replica,
+            envs.SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
+            * layers[0].top_k,
         )
         self.top_k = layers[0].top_k
         try:
@@ -117,20 +120,21 @@ class OnlineEplbManager:
     def balance(self, layer: FusedMoE, logical_topk_ids: torch.Tensor) -> BalancePlan:
         if not self.active:
             raise RuntimeError("Online EPLB balance requires an active forward")
-        if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError("Online EPLB CPU reference planning cannot be captured")
         if logical_topk_ids.ndim != 2 or logical_topk_ids.shape[1] != self.top_k:
             raise ValueError("Online EPLB requires explicit [tokens, routed top-k] IDs")
-        ids = logical_topk_ids.reshape(-1).to(torch.int64)
-        e = self.balancer.num_experts
-        valid = (ids >= 0) & (ids < e)
-        local_counts = torch.zeros(e, dtype=torch.int64, device=ids.device)
-        local_counts.scatter_add_(0, ids.clamp(0, e - 1), valid.to(torch.int64))
-        counts = torch.empty(
-            (self.balancer.world_size, e), dtype=torch.int64, device=ids.device
+        if self._prefetch_ticket is not None:
+            raise RuntimeError(
+                "Online EPLB must join the previous prefetch before balancing"
+            )
+        # The runner serializes forwards/layers on its compute stream. Prefetch
+        # wait and combine join communication before the next workspace reuse.
+        self.balancer.prepare_local_counts(logical_topk_ids)
+        dist.all_gather_into_tensor(
+            self.balancer.counts.view(-1),
+            self.balancer.local_counts,
+            group=self.ep_group,
         )
-        dist.all_gather_into_tensor(counts.view(-1), local_counts, group=self.ep_group)
-        plan = self.balancer.plan(counts)
+        plan = self.balancer.plan()
         self._prefetch_ticket = self.prefetcher.prefetch_weight_async(
             layer_weights=layer.get_online_expert_weights(),
             redundancy_mapping=plan.redundancy_mapping,
@@ -138,6 +142,8 @@ class OnlineEplbManager:
         return plan
 
     def wait_prefetch(self, layer: FusedMoE) -> None:
+        if self._prefetch_ticket is None:
+            raise RuntimeError("Online EPLB wait requires a pending prefetch")
         self.prefetcher.wait_prefetch(
             self._prefetch_ticket, consumer_stream=torch.cuda.current_stream()
         )
@@ -149,6 +155,7 @@ class OnlineEplbManager:
             self._prefetch_ticket.replica_weights.tensors(),
         ):
             target[m:].copy_(source, non_blocking=True)
+        self._prefetch_ticket = None
 
     def cleanup(self) -> None:
         if self.prefetcher is not None:

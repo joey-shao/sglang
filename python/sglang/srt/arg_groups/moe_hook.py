@@ -580,7 +580,6 @@ def validate_online_expert_balancing(server_args: Any) -> None:
         raise ValueError(f"Online EP does not support: {', '.join(unsupported)}")
     if cfg.deepep_v2_mode != "direct" or cfg.tp_size < 2:
         raise ValueError("Online EP requires direct mode with at least two EP ranks")
-    # The CPU reference planner and contiguous pre-permute use host counts.
     graph_config = with_phase(
         cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
     )

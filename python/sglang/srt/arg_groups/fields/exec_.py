@@ -800,13 +800,13 @@ class ExecMoe(msgspec.Struct):
     ] = False
     online_ep_redundant_slots_per_rank: A[
         int, "Number of cross-layer shared replica slots per rank for online EP."
-    ] = 4
+    ] = 2
     online_ep_min_forward_tokens: A[
         int, "Minimum global unpadded prefill tokens to activate online EP balancing."
-    ] = 1
+    ] = 4096
     online_ep_min_tokens_per_replica: A[
         int, "Minimum token quota moved to a replica by the online EP planner."
-    ] = 1
+    ] = 1024
     ep_dispatch_algorithm: A[
         Optional[Literal["static", "dynamic", "fake", "lp"]],
         "The algorithm to choose ranks for redundant experts in expert parallel.",

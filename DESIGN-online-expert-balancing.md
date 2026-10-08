@@ -1,8 +1,10 @@
 # 融入 MoE Forward 的全局 Online EPLB 设计
 
+当前 GPU planning 方案见 [Online EPLB GPU Planning 设计](DESIGN-online-eplb-gpu-planning.md)。2026-10-08 已决定仅保留 GPU planning，并删除本次相关测试、CPU reference 和 benchmark 代码。本文后续 CPU 参考实现与测试描述属于历史设计；planner、BalancePlan、remap 与交付范围以专项设计为准。
+
 | 项目 | 内容 |
 | --- | --- |
-| 状态 | 已按全局 manager + 统一 prefetcher 重构；CPU 参考测试通过，GPU 验证待完成，见第 18 节 |
+| 状态 | 已按全局 manager + 统一 prefetcher 重构；当前仅保留 GPU planning，相关测试代码已删除，GPU 验证待完成 |
 | 日期 | 2026-10-03 |
 | 适用系统 | SGLang NVIDIA CUDA 推理路径 |
 | 目标后端 | DeepEP 2.5 `EPBuffer` |
