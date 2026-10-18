@@ -63,7 +63,12 @@ from sglang.kernels.ops.attention.flash_attention import (
 
 
 def _should_disable_scheduler_metadata_precompute() -> bool:
-    return bool(get_parallel().enable_prefill_cp or get_parallel().enable_dp_attention)
+    parallel = get_parallel()
+    return bool(
+        parallel.enable_prefill_cp
+        or parallel.enable_dp_attention
+        or parallel.ulysses_sp_size > 1
+    )
 
 
 @dataclass

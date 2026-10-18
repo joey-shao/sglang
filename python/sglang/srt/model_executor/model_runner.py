@@ -78,6 +78,9 @@ from sglang.srt.layers.cp.utils import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import create_sampler
+from sglang.srt.layers.sp.sp_strategy import (
+    get_sp_strategy,
+)
 from sglang.srt.lora.lora_manager import LoRAManager, init_lora_cuda_graph_moe_buffers
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.schedule_batch import sanity_check_mm_pad_shift_value
@@ -1611,7 +1614,9 @@ class ModelRunner:
         Extension point for per-forward SP gating; the default behavior shards iff
         it holds a gathered buffer.
         """
-        return require_gathered_buffer()
+        # Ulysses owns its token shard at the model boundary. Keep the count
+        # global here; MoE dispatch localizes it over SP rather than full TP.
+        return get_sp_strategy() is None and require_gathered_buffer()
 
     def _prepare_eager_forward_batch(self, forward_batch: ForwardBatch) -> None:
         """Pad / normalize a batch for the eager (non-cuda-graph) forward.

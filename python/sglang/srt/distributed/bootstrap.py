@@ -316,6 +316,7 @@ def _init_parallel_groups(
     )
     initialize_model_parallel(
         duplicate_tp_group=get_disagg().enable_pdmux,
+        ulysses_sequence_parallel_size=get_parallel().ulysses_sp_size,
         enable_symm_mem=get_exec().comm.enable_symm_mem,
         # Only WORLD is extended during scale-up. The joiner's model-parallel
         # groups are fixed groups local to its launch cohort.

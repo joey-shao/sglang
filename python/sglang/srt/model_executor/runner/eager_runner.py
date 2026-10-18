@@ -32,6 +32,7 @@ from sglang.srt.layers.cp.utils import (
     prepare_cp_forward,
 )
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput
+from sglang.srt.layers.sp.sp_strategy import get_sp_strategy, sp_model_forward
 from sglang.srt.model_executor.cuda_graph_buffer_registry import (
     build_eager_registry,
 )
@@ -262,6 +263,8 @@ class EagerRunner(BaseRunner):
         ctx = device_timer_ctx(model_runner.device_timer, "decode")
 
         with ctx, pdmux_ctx:
+            if get_sp_strategy() is not None:
+                return self._execute_sp(forward_batch, kwargs)
             return model_runner.model.forward(
                 forward_batch.input_ids,
                 forward_batch.positions,
@@ -339,7 +342,9 @@ class EagerRunner(BaseRunner):
         )
         with device_timer_ctx(model_runner.device_timer, category):
             pcg_runner = model_runner.prefill_cuda_graph_runner
-            if (
+            if get_sp_strategy() is not None:
+                ret = self._execute_sp(forward_batch, kwargs)
+            elif (
                 _is_hip
                 and pcg_runner is not None
                 and not isinstance(pcg_runner, EagerRunner)
@@ -375,6 +380,11 @@ class EagerRunner(BaseRunner):
                     **kwargs,
                 )
         return ret
+
+    def _execute_sp(
+        self, forward_batch: ForwardBatch, kwargs: dict
+    ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
+        return sp_model_forward(self.model_runner.model, forward_batch, **kwargs)
 
     def _execute_extend_cp(
         self, forward_batch: ForwardBatch, kwargs: dict

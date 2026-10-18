@@ -53,6 +53,8 @@ from sglang.srt.runtime_context import get_exec, get_parallel
 
 def _variants():
     yield BatchVariant.ORDINARY
+    if get_parallel().ulysses_sp_size > 1:
+        yield BatchVariant.ULYSSES
     if _generic_prefill_cp_shards_tokens():
         yield BatchVariant.CONTEXT_PARALLEL
     if _input_can_be_scattered():
@@ -69,6 +71,8 @@ def _rows(variant):
     local = Layout.sharded_over(
         TokenAxis.ATTN_DP, TokenAxis.ATTN_CP, TokenAxis.ATTN_TP_SCATTER, axis_sizes=axes
     )
+    if variant is BatchVariant.ULYSSES:
+        attention = local = Layout(frozenset({TokenAxis.ULYSSES_SP}))
     return axes, attention, local, Layout.sharded_over(axis_sizes=axes)
 
 
@@ -112,6 +116,23 @@ def _ffn_decl(
         and not _gathers_over_attention_cp()
     )
     group = SumGroup.MOE_OUTPUT if sparse else SumGroup.TP
+    if variant is BatchVariant.ULYSSES:
+        # Like CP, the stack keeps local residuals. Only FFNs that need the
+        # full TP input gather it, then return their output to the same shard.
+        rows = attention if on_local else full
+        return (
+            StageDecl(
+                StageInput(rows, read=read),
+                StageOutput(
+                    rows,
+                    group=None if on_local else group,
+                    update=update,
+                    transform=output_transform,
+                ),
+            ),
+            attention,
+            attention,
+        )
     if variant is BatchVariant.SEQUENCE_PARALLEL:
         return (
             StageDecl(
@@ -386,12 +407,17 @@ def _resolve(stage, variant, following=None):
         if stage.gathers_tp_input and (sp or scattered or _use_ag_after_qlora)
         else frozenset()
     )
-    owes = not sp and axes[TokenAxis.ATTN_TP_SCATTER] > 1
+    ulysses = variant is BatchVariant.ULYSSES
+    width = (
+        get_parallel().attn_proj_tp_size if ulysses else axes[TokenAxis.ATTN_TP_SCATTER]
+    )
+    owes = not sp and width > 1
+    group = SumGroup.ATTN_PROJ_TP if ulysses else SumGroup.ATTN_TP
     declaration = StageDecl(
         StageInput(attention, gathers_itself=gathers, read=stage.read),
         StageOutput(
             local if sp else attention,
-            group=SumGroup.ATTN_TP if owes else None,
+            group=group if owes else None,
             always_leaves=owes
             and (
                 stage.reduction is ProducerReduction.PARTIAL

@@ -75,6 +75,7 @@ if TYPE_CHECKING:
     from sglang.srt.layers.dcp.metadata import DecodeContextParallelMetadata
     from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+    from sglang.srt.layers.sp.sp_strategy import SPBatchMetadata
     from sglang.srt.managers.schedule_batch import MultimodalInputs, ScheduleBatch
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
@@ -725,6 +726,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     tbo_padded_len: Optional[int] = None
     tbo_children: Optional[List[ForwardBatch]] = None
 
+    # Temporary model-input shard layout; request and attention data stay global.
+    sp_metadata: Optional[SPBatchMetadata] = None
+
     attn_cp_metadata: Optional[BaseContextParallelMetadata] = None
 
     # For decode context parallel.
@@ -1262,6 +1266,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         if self.num_token_non_padded is None:
             return None
+
+        if self.sp_metadata is not None:
+            local_tokens = self.sp_metadata.local_num_tokens
+            return (
+                self.num_token_non_padded - self.sp_metadata.sp_rank * local_tokens
+            ).clamp(min=0, max=local_tokens)
 
         if is_moe_input_scattered_across_dp_ranks():
             # a2a dispatch, FP4 all-gather and dwdp all route the local shard.

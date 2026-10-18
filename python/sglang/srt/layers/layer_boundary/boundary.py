@@ -45,6 +45,7 @@ from sglang.srt.layers.layer_boundary.ops import (
     scatter_output,
     take_back_attention_cp_shard,
     take_back_cp_shard,
+    take_back_ulysses_shard,
     tp_reduce_scatter,
     tp_slice,
     update_and_gather,
@@ -56,6 +57,7 @@ from sglang.srt.layers.layer_boundary.prepare import (
     _mlp_input_dp_replicate,
     _mlp_input_gather_attention_cp,
     _mlp_input_gather_moe_cp,
+    _mlp_input_gather_ulysses,
     _mlp_input_on_residual_shard,
     _mlp_input_residual_into_sum,
     _mlp_input_scatter,
@@ -98,6 +100,11 @@ def _cp_moves() -> CpMoves:
         gather=_mlp_input_gather_moe_cp,
         take_back=scatter_moe_cp_output,
     )
+
+
+def _sp_moves() -> CpMoves:
+    """Use the CP-style FFN gather/return contract over the Ulysses SP group."""
+    return CpMoves(gather=_mlp_input_gather_ulysses, take_back=take_back_ulysses_shard)
 
 
 class Boundary(msgspec.Struct, frozen=True):
@@ -412,8 +419,8 @@ def _select_input_steps(
             ),
             None,
         )
-    if gathered == {TokenAxis.ATTN_CP}:
-        # Each CP rank completes its own chunk, then the CP moves gather them.
+    if gathered in ({TokenAxis.ATTN_CP}, {TokenAxis.ULYSSES_SP}):
+        # Complete and read each local chunk before the strategy gathers it.
         if cp_moves is None:
             raise NotImplementedError(f"{produced=} {need=}")
         on_chunk, _ = _select_input_steps(
@@ -490,7 +497,7 @@ def _select_input_steps(
             return (partial(_mlp_input_residual_into_sum, read=read), None)
         # A sum over TP completes only on rows every TP rank holds: the TP group
         # spans attention DP and CP.
-        if owes is not SumGroup.ATTN_TP and (
+        if owes not in (SumGroup.ATTN_TP, SumGroup.ATTN_PROJ_TP) and (
             owes is not SumGroup.TP or produced.layout.sharded
         ):
             raise NotImplementedError(f"{produced=} {need=}")
@@ -581,7 +588,7 @@ def _select_ffn_output_move(
         )
     if to != residual or not produced.layout.sharded <= residual.sharded:
         raise NotImplementedError(f"{produced=} {residual=} {to=}")
-    if returned == {TokenAxis.ATTN_CP}:
+    if returned in ({TokenAxis.ATTN_CP}, {TokenAxis.ULYSSES_SP}):
         if cp_moves is None:
             raise NotImplementedError(f"{produced=} {residual=} {to=}")
         if not produced.leaves_for_reduce_scatter:

@@ -49,6 +49,10 @@ class Parallel(msgspec.Struct):
             aliases=["--tensor-parallel-size"],
         ),
     ] = 1
+    ulysses_sp_size: A[
+        int,
+        "Ulysses sequence parallelism size. Divides --tp-size (the total worker count); attention uses TP subgroups of tp_size / ulysses_sp_size ranks and token shards across SP. FFN, embedding and LM-head weights retain their ordinary parallel layout. Requires FlashAttention (fa3/fa4) attention, eager or breakable CUDA graph prefill, and eager or full CUDA graph decode. Supports ordinary overlap scheduling; two-batch overlap is unsupported. Cannot be combined with attention context parallelism, decode context parallelism, or DP attention.",
+    ] = 1
     dcp_size: A[
         int,
         Arg(
@@ -282,6 +286,10 @@ class Parallel(msgspec.Struct):
         doc="Attention tensor-parallel width: `tp_size` divided by the "
         "attention-DP and attention-CP dimensions.",
     )
+    attn_proj_tp_size = Derived(
+        fn="sglang.srt.runtime_context.attn_proj_tp_size_of",
+        doc="Attention projection TP width: attention TP divided by Ulysses SP.",
+    )
     attn_dp_size = Derived(
         fn="sglang.srt.runtime_context.attn_dp_size_of",
         doc="Attention data-parallel width: `dp_size` when DP attention is "
@@ -316,6 +324,9 @@ class Parallel(msgspec.Struct):
     )
     attn_tp_rank = Derived(
         doc=("This process's place in the attention tensor-parallel group.")
+    )
+    attn_proj_tp_rank = Derived(
+        doc="This process's place in the attention projection TP group."
     )
     attn_cp_rank = Derived(
         doc=("This process's place in the attention context-parallel group.")
@@ -366,6 +377,7 @@ class Parallel(msgspec.Struct):
     moe_dp_group = Derived(doc="The MoE data-parallel group.")
     moe_tp_group = Derived(doc="The MoE tensor-parallel group.")
     attn_tp_group = Derived(doc="The attention tensor-parallel group.")
+    attn_proj_tp_group = Derived(doc="The attention QKV/O projection TP group.")
     attn_cp_group = Derived(doc="The attention context-parallel group.")
     shared_experts_tp_group = Derived(doc=("The shared-expert tensor-parallel group."))
     dcp_group = Derived(doc="The decode context-parallel group.")

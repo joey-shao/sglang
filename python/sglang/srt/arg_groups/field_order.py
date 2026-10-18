@@ -74,6 +74,7 @@ POSITIONAL_FIELD_ORDER = (
     "nnodes",
     "node_rank",
     "tp_size",
+    "ulysses_sp_size",
     "dcp_size",
     "pp_size",
     "pp_max_micro_batch_size",

@@ -52,6 +52,7 @@ class HandoffRows(Enum):
 class BatchVariant(Enum):
     ORDINARY = auto()
     CONTEXT_PARALLEL = auto()
+    ULYSSES = auto()
     INPUT_SCATTERED = auto()
     SEQUENCE_PARALLEL = auto()
 
@@ -168,8 +169,9 @@ class FusedMlpInput(msgspec.Struct, frozen=True):
 
 
 class CpMoves(msgspec.Struct, frozen=True):
-    """How a CP extend's rows reach an FFN that needs all of them and come back,
-    chosen once for the kind of prefill CP: ``gather`` gathers the FFN input
+    """How token shards reach an FFN that needs all rows and come back.
+
+    Bound for the active CP or Ulysses strategy: ``gather`` gathers the FFN input
     after each rank has completed its own block, ``take_back`` returns this
     rank's block of a complete output, and ``reduce_scatter``, where there is
     one, completes a sum left over the ranks of ``reduce_scatter_group()`` and

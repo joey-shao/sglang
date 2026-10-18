@@ -47,6 +47,14 @@ def _unsupported_derived_weight_cache_error(
     old weights. The check is startup-determined and rank-uniform, so an
     update never proceeds on some workers while rejected on others.
     """
+    from sglang.srt.runtime_context import get_parallel
+
+    if get_parallel().ulysses_sp_size > 1:
+        return (
+            "Online weight updates are not supported with Ulysses parallel: "
+            "the attention projections must be rebuilt after an update."
+        )
+
     if model is not None and any(
         getattr(module, "_hc_attn_tf32_parts", None) is not None
         or getattr(module, "_hc_ffn_tf32_parts", None) is not None

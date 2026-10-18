@@ -76,6 +76,11 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput
+from sglang.srt.layers.sp.sp_strategy import (
+    PrefillSPBCGInput,
+    execute_prefill_sp_bcg,
+    get_sp_strategy,
+)
 from sglang.srt.model_executor.cuda_graph_buffer_registry import (
     CudaGraphBufferRegistry,
     build_prefill_registry,
@@ -448,6 +453,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self._capture_lora = False
         self.enable_cp_bcg_capture = False
         self.prefill_cp_bcg_input: Optional[PrefillCPBCGInput] = None
+        self.prefill_sp_bcg_input: Optional[PrefillSPBCGInput] = None
         # TcPiecewise does its compile pass during backend construction.
         # Wrap only that path with the prefill CUDA graph failure hint.
         try:
@@ -558,6 +564,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 "backends that implement fixed-context prefill graph metadata; "
                 f"got {type(model_runner.attn_backend).__name__}"
             )
+
+        if get_parallel().ulysses_sp_size > 1:
+            self.prefill_sp_bcg_input = PrefillSPBCGInput.create(self)
 
         # Static hidden_states buffer giving the captured graph a stable
         # address; load_batch refreshes it from live spec_info at replay.
@@ -1637,6 +1646,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         else:
             self._init_forward_metadata_for_capture(forward_batch, shape_key)
 
+        if get_sp_strategy() is not None:
+            # Plan global attention metadata before staging the local body inputs.
+            self.prefill_sp_bcg_input.prepare(
+                self, forward_batch, static_num_tokens=num_tokens, capture=True
+            )
+
         def run_once():
             # Record LoRA kernels even when capture uses base-model requests.
             with (
@@ -1937,6 +1952,15 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             metadata_forward_batch, static_forward_batch, shape_key
         )
 
+        if get_sp_strategy() is not None:
+            # Eager attention callbacks read this live view during BCG replay;
+            # graph segments retain the capture bucket's local token layout.
+            self.prefill_sp_bcg_input.prepare(
+                self,
+                static_forward_batch,
+                static_num_tokens=static_num_tokens,
+                capture=False,
+            )
         return static_forward_batch
 
     def _fill_input_embeds_slot(self, args, layer_kwargs, static_num_tokens: int):
@@ -2125,6 +2149,15 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     static_num_tokens,
                     raw_num_tokens,
                     **kwargs,
+                )
+            elif get_sp_strategy() is not None:
+                output = execute_prefill_sp_bcg(
+                    self,
+                    forward_batch,
+                    static_forward_batch,
+                    static_num_tokens,
+                    raw_num_tokens,
+                    shape_key,
                 )
             elif self._uses_eager_prefill_tail():
                 output = self._execute_body_capture(

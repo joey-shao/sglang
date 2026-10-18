@@ -200,6 +200,11 @@ def attn_tp_size_of(cfg: Any):
     return parallel_widths_of(cfg)["attn_tp_size"]
 
 
+def attn_proj_tp_size_of(cfg: Any):
+    """Projection width; backend/cache attention TP retains its full width."""
+    return attn_tp_size_of(cfg) // cfg.ulysses_sp_size
+
+
 def attn_dp_size_of(cfg: Any):
     """`attn_dp_size`, computed at publish. See `parallel_widths_of`."""
     return parallel_widths_of(cfg)["attn_dp_size"]
@@ -442,6 +447,12 @@ class ParallelContext:
             yield self
         finally:
             self._overrides = saved
+
+    @property
+    def ulysses_sp_group(self):
+        from sglang.srt.distributed import parallel_state
+
+        return parallel_state.get_ulysses_sp_group()
 
 
 def _derived_widths() -> dict:
@@ -1562,7 +1573,11 @@ def _attention_ranks(parallel, tp_rank: int) -> dict:
         attn_cp_size=parallel.attn_cp_size,
         enable_dp_attention=parallel.enable_dp_attention,
     )
-    return {"attn_tp_rank": attn_tp_rank, "attn_dp_rank": attn_dp_rank}
+    return {
+        "attn_tp_rank": attn_tp_rank,
+        "attn_dp_rank": attn_dp_rank,
+        "attn_proj_tp_rank": attn_tp_rank // parallel.ulysses_sp_size,
+    }
 
 
 def assert_published(server_args, *, role: str) -> RuntimeContext:

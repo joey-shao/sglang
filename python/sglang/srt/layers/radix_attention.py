@@ -32,6 +32,7 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import 
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     get_tc_piecewise_forward_context,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.common import is_hip
 from sglang.srt.utils.custom_op import register_custom_op
 
@@ -118,11 +119,16 @@ class RadixAttention(nn.Module):
         use_irope: bool = False,
         prefix: str = "",
         use_prefill_attention_wrapper: bool = True,
+        sp_size: int = 1,
     ):
         super().__init__()
-        self.tp_q_head_num = num_heads
-        self.tp_k_head_num = num_kv_heads
-        self.tp_v_head_num = num_kv_heads
+        self.sp_size = sp_size
+        # Projections use fewer TP ranks than the backend under Ulysses, while
+        # backend/cache callers always see full-TP heads. Derive input counts
+        # below so non-SP decode-TP overrides retain their existing behavior.
+        self.tp_q_head_num = num_heads // sp_size
+        self.tp_k_head_num = num_kv_heads // sp_size
+        self.tp_v_head_num = num_kv_heads // sp_size
         self.head_dim = head_dim
         self.qk_head_dim = head_dim
         self.v_head_dim = v_head_dim if v_head_dim != -1 else head_dim
@@ -156,6 +162,104 @@ class RadixAttention(nn.Module):
         self.logit_capping_method = logit_capping_method
         self.xai_temperature_len = -1
 
+    @property
+    def input_q_head_num(self) -> int:
+        return self.tp_q_head_num * self.sp_size
+
+    @property
+    def input_k_head_num(self) -> int:
+        return self.tp_k_head_num * self.sp_size
+
+    @property
+    def input_v_head_num(self) -> int:
+        return self.tp_v_head_num * self.sp_size
+
+    def _forward_backend(
+        self, q, k, v, forward_batch, save_kv_cache=True, *, output=None, **kwargs
+    ):
+        """Run attention; with an output buffer, write it and return only LSE."""
+        if self.sp_size == 1:
+            result = get_attn_backend().forward(
+                q, k, v, self, forward_batch, save_kv_cache, **kwargs
+            )
+        else:
+            from sglang.srt.layers.sp.sp_strategy import (
+                exchange_attention_output,
+                exchange_qkv,
+            )
+
+            metadata = forward_batch.sp_metadata
+            return_lse = bool(kwargs.get("return_lse") or forward_batch.mha_return_lse)
+            if metadata.attn_num_tokens == 0:
+                result = v.new_zeros(
+                    (metadata.local_num_tokens, self.input_q_head_num * self.v_head_dim)
+                )
+                if return_lse:
+                    result = (
+                        result.view(
+                            metadata.local_num_tokens,
+                            self.input_q_head_num,
+                            self.v_head_dim,
+                        ),
+                        q.new_zeros(
+                            (metadata.local_num_tokens, self.input_q_head_num),
+                            dtype=torch.float32,
+                        ),
+                    )
+            else:
+                group = get_parallel().ulysses_sp_group
+                # Exchange fixed local buckets before removing global padding.
+                # Ranks with no live local tokens still join both collectives.
+                q, k, v = exchange_qkv(q, k, v, metadata=metadata, group=group)
+                q = q.view(-1, self.tp_q_head_num, self.qk_head_dim)
+                k = k.view(-1, self.tp_k_head_num, self.qk_head_dim)
+                v = v.view(-1, self.tp_v_head_num, self.v_head_dim)
+
+                original_loc = forward_batch.out_cache_loc
+                original_output = forward_batch._attn_output
+                try:
+                    forward_batch.out_cache_loc = original_loc[
+                        : metadata.attn_num_tokens
+                    ]
+                    # Graph output has local tokens and projection heads. The
+                    # backend produces global tokens before inverse exchange.
+                    forward_batch._attn_output = None
+                    if return_lse:
+                        kwargs["return_lse"] = True
+                    result = get_attn_backend().forward(
+                        q, k, v, self, forward_batch, save_kv_cache, **kwargs
+                    )
+                finally:
+                    forward_batch.out_cache_loc = original_loc
+                    forward_batch._attn_output = original_output
+
+                if return_lse:
+                    result, lse = result
+                    result = exchange_attention_output(
+                        result, metadata=metadata, group=group
+                    )
+                    lse = exchange_attention_output(lse, metadata=metadata, group=group)
+                    result = (
+                        result.view(
+                            metadata.local_num_tokens,
+                            self.input_q_head_num,
+                            self.v_head_dim,
+                        ),
+                        lse,
+                    )
+                else:
+                    result = exchange_attention_output(
+                        result, metadata=metadata, group=group
+                    )
+
+        if output is None:
+            return result
+        lse = None
+        if isinstance(result, tuple):
+            result, lse, *_ = result
+        output.view(result.shape).copy_(result)
+        return lse
+
     def forward(
         self,
         q,
@@ -170,10 +274,10 @@ class RadixAttention(nn.Module):
             # For cross-layer sharing, kv can be None
             assert v is not None
             if "k_rope" not in kwargs:
-                k = k.view(-1, self.tp_k_head_num, self.qk_head_dim)
-                v = v.view(-1, self.tp_v_head_num, self.v_head_dim)
+                k = k.view(-1, self.input_k_head_num, self.qk_head_dim)
+                v = v.view(-1, self.input_v_head_num, self.v_head_dim)
             else:
-                k = k.view(-1, self.tp_k_head_num, self.v_head_dim)
+                k = k.view(-1, self.input_k_head_num, self.v_head_dim)
 
         context = get_tc_piecewise_forward_context()
         if (
@@ -189,14 +293,14 @@ class RadixAttention(nn.Module):
         ):
             if kwargs.get("idx_q") is not None:
                 if is_in_breakable_cuda_graph():
-                    return get_attn_backend().forward(
-                        q, k, v, self, forward_batch, save_kv_cache, **kwargs
+                    return self._forward_backend(
+                        q, k, v, forward_batch, save_kv_cache, **kwargs
                     )
                 idx_q = kwargs["idx_q"]
                 idx_k = kwargs["idx_k"]
                 idx_v = kwargs.get("idx_v")
                 attn_out = q.new_empty(
-                    (q.shape[0], self.tp_q_head_num * self.v_head_dim)
+                    (q.shape[0], self.input_q_head_num * self.v_head_dim)
                 )
                 idx_out = q.new_empty((q.shape[0], idx_q.shape[1] * idx_q.shape[2]))
                 unified_sparse_attention_with_output(
@@ -222,7 +326,7 @@ class RadixAttention(nn.Module):
                 out_dtype = torch.bfloat16
             if self.qk_head_dim != self.v_head_dim:
                 output = q.new_empty(
-                    (q.shape[0], self.tp_q_head_num * self.v_head_dim),
+                    (q.shape[0], self.input_q_head_num * self.v_head_dim),
                     dtype=out_dtype,
                 )
             else:
@@ -254,7 +358,7 @@ class RadixAttention(nn.Module):
                     )
                 if kwargs.get("return_lse") or forward_batch.mha_return_lse:
                     assert lse is not None
-                    return output.view(-1, self.tp_q_head_num, self.v_head_dim), lse
+                    return output.view(-1, self.input_q_head_num, self.v_head_dim), lse
                 return output
             # Chunked-prefix MHA needs LSE to merge independently normalized
             # suffix and cached-prefix attention states.
@@ -288,14 +392,13 @@ class RadixAttention(nn.Module):
                 **kwargs,
             )
             if return_lse:
-                return output.view(-1, self.tp_q_head_num, self.v_head_dim), lse
+                return output.view(-1, self.input_q_head_num, self.v_head_dim), lse
             return output
         else:
-            return get_attn_backend().forward(
+            return self._forward_backend(
                 q,
                 k,
                 v,
-                self,
                 forward_batch,
                 save_kv_cache,
                 **kwargs,
@@ -328,6 +431,33 @@ def _unified_attention_with_output_impl(
     forward_batch = context.forward_batch
     attention_layers = context.attention_layers
     attention_layer = attention_layers[layer_id]
+
+    if attention_layer.sp_size > 1:
+        kwargs = {
+            name: value
+            for name, value in (
+                ("q_rope", q_rope),
+                ("k_rope", k_rope),
+                ("sinks", sinks),
+                ("attn_sink", attn_sink),
+                ("cos_sin_cache", cos_sin_cache),
+                ("is_neox", is_neox),
+                ("llama_4_scaling", llama_4_scaling),
+                ("topk_indices", topk_indices),
+            )
+            if value is not None
+        }
+        if return_lse:
+            kwargs["return_lse"] = True
+        return attention_layer._forward_backend(
+            query,
+            key,
+            value,
+            forward_batch,
+            save_kv_cache,
+            output=output,
+            **kwargs,
+        )
     real_query_num_tokens = forward_batch.global_num_token_non_padded_cpu
     # Ordinary PCG attention pads Q/K/V to the same token bucket. Prefix MHA
     # instead supplies a fixed-capacity K/V chunk whose extent is independent
@@ -393,11 +523,10 @@ def _unified_attention_with_output_impl(
     # the FA kernel validates out.size(0) == q.size(0).
     forward_batch._attn_output = output[:real_query_num_tokens]
 
-    ret = get_attn_backend().forward(
+    ret = attention_layer._forward_backend(
         query,
         key,
         value,
-        attention_layer,
         forward_batch,
         save_kv_cache,
         **kwargs,
@@ -614,6 +743,16 @@ def attention_with_output_extra_kwargs(
     context = get_tc_piecewise_forward_context()
     forward_batch = context.forward_batch
     attention_layer = context.attention_layers[layer_id]
+    if attention_layer.sp_size > 1:
+        return attention_layer._forward_backend(
+            query,
+            key,
+            value,
+            forward_batch,
+            save_kv_cache,
+            output=output,
+            **extra_kwargs,
+        )
     real_num_tokens = forward_batch.global_num_token_non_padded_cpu
 
     if real_num_tokens == 0:
@@ -646,8 +785,8 @@ def attention_with_output_extra_kwargs(
     forward_batch.out_cache_loc = original_out_cache_loc[:real_num_tokens]
     forward_batch._attn_output = output[:real_num_tokens]
 
-    ret = get_attn_backend().forward(
-        query, key, value, attention_layer, forward_batch, save_kv_cache, **kwargs
+    ret = attention_layer._forward_backend(
+        query, key, value, forward_batch, save_kv_cache, **kwargs
     )
     forward_batch.out_cache_loc = original_out_cache_loc
 

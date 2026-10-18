@@ -198,6 +198,14 @@ def move_rows(
     gathered, cut = rows.sharded - to.sharded, to.sharded - rows.sharded
     if (gathered and cut) or TokenAxis.ATTN_CP in gathered | cut:
         raise NotImplementedError(f"{rows=} {to=}")
+    if TokenAxis.ULYSSES_SP in gathered:
+        from sglang.srt.layers.sp.sp_strategy import get_sp_strategy
+
+        hidden_states = get_sp_strategy().gather_hidden_states(
+            hidden_states, forward_batch
+        )
+    if TokenAxis.ULYSSES_SP in cut:
+        hidden_states = forward_batch.sp_metadata.slice_tokens(hidden_states)
     if TokenAxis.ATTN_TP_SCATTER in gathered:
         hidden_states = _redistribute_from_attn_tp_shards(hidden_states)
     if TokenAxis.ATTN_DP in gathered:
@@ -346,6 +354,11 @@ def scatter_output(
 ):
     assert residual is None, "not yet handled residual!=None"
     return _redistribute_to_attn_tp_shards(hidden_states), None
+
+
+def take_back_ulysses_shard(hidden_states, residual, forward_batch, **kwargs):
+    """Return the completed full-TP FFN output to its attention token shard."""
+    return forward_batch.sp_metadata.slice_tokens(hidden_states), residual
 
 
 def take_back_attention_cp_shard(

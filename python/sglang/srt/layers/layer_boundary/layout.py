@@ -43,6 +43,7 @@ class TokenAxis(Enum):
 
     ATTN_DP = auto()
     ATTN_CP = auto()
+    ULYSSES_SP = auto()
     # Each attention-TP rank holds a slice of its group's tokens.
     ATTN_TP_SCATTER = auto()
 
@@ -73,6 +74,7 @@ class SumGroup(Enum):
     from get_parallel() when the sum runs."""
 
     ATTN_TP = auto()
+    ATTN_PROJ_TP = auto()
     TP = auto()
     # The group one all-reduce of a MoE output runs over.
     MOE_OUTPUT = auto()
@@ -148,6 +150,8 @@ def _sum_group(group: SumGroup) -> GroupCoordinator:
     parallel = get_parallel()
     if group is SumGroup.ATTN_TP:
         return parallel.attn_tp_group
+    if group is SumGroup.ATTN_PROJ_TP:
+        return parallel.attn_proj_tp_group
     if group is SumGroup.TP:
         return parallel.tp_group
     if group is SumGroup.MOE_OUTPUT:

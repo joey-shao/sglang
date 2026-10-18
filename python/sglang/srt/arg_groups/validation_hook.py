@@ -10,6 +10,8 @@ from typing import Any, Dict, List, Optional
 
 from sglang.srt.arg_groups.overrides import (
     _hisparse_validation,
+    attention_backends_of,
+    model_config_of,
     resolved_view,
     resolving_view,
     run_post_process_pass,
@@ -87,10 +89,80 @@ def check_pipeline_parallel_compat(cfg: Any) -> None:
     )
 
 
+def check_ulysses_sp_args(server_args: Any) -> None:
+    """Validate Ulysses once at startup, before loading weights or creating groups."""
+    cfg = resolving_view(server_args)
+    if cfg.ulysses_sp_size < 1:
+        raise ValueError("Ulysses SP size must be positive")
+    if cfg.ulysses_sp_size == 1:
+        return
+    if cfg.tp_size < 1 or cfg.tp_size % cfg.ulysses_sp_size:
+        raise ValueError("Ulysses SP size must divide the positive full TP size")
+
+    for enabled, feature in (
+        (cfg.pp_size != 1, "pipeline parallelism"),
+        (cfg.enable_dp_attention, "DP attention"),
+        (
+            cfg.attn_cp_size != 1 or cfg.enable_prefill_cp,
+            "attention context parallelism",
+        ),
+        (cfg.dcp_size != 1, "decode context parallelism"),
+        (cfg.moe_dp_size != 1, "MoE data parallelism"),
+        (cfg.enable_pdmux, "PD multiplexing"),
+        (
+            cfg.ep_join_mode in ("scale", "recover") or cfg.ep_join_rank_offset != 0,
+            "elastic EP joining",
+        ),
+        (cfg.enable_two_batch_overlap, "two-batch overlap"),
+        (cfg.enable_torch_compile, "torch.compile"),
+        (cfg.speculative_algorithm is not None, "speculative decoding"),
+        (cfg.enable_lora, "LoRA"),
+    ):
+        if enabled:
+            raise ValueError(f"Ulysses parallel cannot be combined with {feature}")
+
+    if any(backend not in ("fa3", "fa4") for backend in attention_backends_of(cfg)):
+        raise ValueError(
+            "Ulysses requires FlashAttention (fa3/fa4) for prefill and decode"
+        )
+    if cfg.cuda_graph_config.prefill.backend not in ("disabled", "breakable"):
+        raise ValueError("Ulysses requires eager or breakable CUDA graph prefill")
+    if cfg.cuda_graph_config.decode.backend not in ("disabled", "full"):
+        raise ValueError("Ulysses requires eager or full CUDA graph decode")
+    if cfg.load_format in ("presharded", "sharded_state"):
+        raise ValueError(
+            "Ulysses requires an unsharded checkpoint; pre-sharded full-TP "
+            "weights do not match its projection TP layout"
+        )
+
+    model_config = model_config_of(server_args)
+    if cfg.model_impl not in ("auto", "sglang") or (
+        model_config.hf_config.architectures[0]
+        not in ("Qwen3ForCausalLM", "Qwen3MoeForCausalLM")
+    ):
+        raise ValueError("Ulysses supports native Qwen3 and Qwen3 MoE")
+    if any(
+        quantization not in (None, "fp8")
+        for quantization in (cfg.quantization, model_config.quantization)
+    ):
+        raise ValueError(
+            "Ulysses supports unquantized weights or native fp8 quantization"
+        )
+    if (
+        model_config.get_total_num_attention_heads() % cfg.tp_size
+        or model_config.get_total_num_kv_heads() % cfg.tp_size
+    ):
+        raise ValueError(
+            "Ulysses requires Q/KV head counts divisible by full TP size; "
+            "KV head replication is not supported"
+        )
+
+
 def check_server_args(server_args: Any):
     from sglang.srt.arg_groups.lora_hook import check_lora_server_args
 
     cfg = resolving_view(server_args)
+    check_ulysses_sp_args(server_args)
 
     # Check parallel size constraints
     if cfg.ep_join_mode != "scale":

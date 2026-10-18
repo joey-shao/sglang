@@ -87,8 +87,8 @@ class Qwen3Attention(nn.Module):
         self.start_layer = start_layer
         self.tp_size = get_parallel().tp_size
         self.total_num_heads = num_heads
-        attn_tp_rank = get_parallel().attn_tp_rank
-        attn_tp_size = get_parallel().attn_tp_size
+        attn_tp_rank = get_parallel().attn_proj_tp_rank
+        attn_tp_size = get_parallel().attn_proj_tp_size
 
         assert self.total_num_heads % attn_tp_size == 0
         self.num_heads = self.total_num_heads // attn_tp_size
@@ -157,6 +157,7 @@ class Qwen3Attention(nn.Module):
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
             prefix=add_prefix("attn", prefix),
+            sp_size=get_parallel().ulysses_sp_size,
         )
         self.alt_stream = alt_stream
 
@@ -471,9 +472,9 @@ class Qwen3Model(Qwen2Model):
                 positions,
                 hidden_states,
                 forward_batch,
-                capture_output=aux_hidden_states.capture
-                if i in self.layers_to_capture
-                else None,
+                capture_output=(
+                    aux_hidden_states.capture if i in self.layers_to_capture else None
+                ),
             )
         if not self.pp_group.is_last_rank:
             return residual_batch.to_pp(hidden_states, forward_batch)

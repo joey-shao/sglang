@@ -512,8 +512,8 @@ class Qwen3MoeAttention(nn.Module):
         self.hidden_size = hidden_size
         self.start_layer = start_layer
 
-        attn_tp_rank = get_parallel().attn_tp_rank
-        attn_tp_size = get_parallel().attn_tp_size
+        attn_tp_rank = get_parallel().attn_proj_tp_rank
+        attn_tp_size = get_parallel().attn_proj_tp_size
 
         self.config = config
         self.total_num_heads = num_heads
@@ -568,8 +568,10 @@ class Qwen3MoeAttention(nn.Module):
             rope_scaling=rope_scaling,
             dual_chunk_attention_config=dual_chunk_attention_config,
         )
+        # Cache writes must follow the SP all-to-all, not the projection RoPE.
         self.compatible_with_fused_kv_buffer = (
-            False if isinstance(self.rotary_emb, MRotaryEmbedding) else True
+            get_parallel().ulysses_sp_size == 1
+            and not isinstance(self.rotary_emb, MRotaryEmbedding)
         )
         self.compatible_with_fused_qk_norm_rope = not isinstance(
             self.rotary_emb, MRotaryEmbedding
@@ -601,6 +603,7 @@ class Qwen3MoeAttention(nn.Module):
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
             prefix=add_prefix("attn", prefix),
+            sp_size=get_parallel().ulysses_sp_size,
         )
 
         self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
@@ -875,11 +878,13 @@ class Qwen3MoeDecoderLayer(nn.Module):
                 ),
                 self.post_attention_layernorm,
             ),
-            previous=declare_ffn(
-                sparse=is_previous_layer_sparse, next_sparse=self.is_layer_sparse
-            )
-            if layer_id != 0
-            else None,
+            previous=(
+                declare_ffn(
+                    sparse=is_previous_layer_sparse, next_sparse=self.is_layer_sparse
+                )
+                if layer_id != 0
+                else None
+            ),
             terminal=layer_id == config.num_hidden_layers - 1,
         )
 

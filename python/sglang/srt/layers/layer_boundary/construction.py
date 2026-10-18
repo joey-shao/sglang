@@ -21,6 +21,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.layer_boundary.adapters.attention import get_attn_tp_context
 from sglang.srt.layers.layer_boundary.boundary import (
     _cp_moves,
+    _sp_moves,
     make_boundary,
     make_output_boundary,
 )
@@ -114,7 +115,7 @@ class StageEdges:
         incoming: Consumer-side contract used to bind prepare.
         outgoing: Producer-side contract used to bind exit transport.
         handoff: Optional attention adapter run after input preparation/movement.
-        cp_moves: Strategy-specific context-parallel gather and return operations.
+        cp_moves: Strategy-specific CP or Ulysses gather and return operations.
 
     No executable neighbouring stage or neighbouring norm is required.
     """
@@ -240,6 +241,8 @@ class StagePlan:
 
     def _variant(self, forward_batch):
         # The batch determines its rows; missing paths must not change them.
+        if forward_batch.sp_metadata is not None:
+            return BatchVariant.ULYSSES
         if get_forward().sp_active:
             return BatchVariant.SEQUENCE_PARALLEL
         if get_attn_tp_context().input_scattered:
@@ -302,7 +305,11 @@ def _bind_stage(declaration, norm, incoming, outgoing, **options):
                 and not declaration.update.adds_plainly
                 else _hand_qkv_hook_its_input
             )
-        moves = _cp_moves() if variant is BatchVariant.CONTEXT_PARALLEL else None
+        moves = None
+        if variant is BatchVariant.ULYSSES:
+            moves = _sp_moves()
+        elif variant is BatchVariant.CONTEXT_PARALLEL:
+            moves = _cp_moves()
         variants[variant] = StageEdges(edge, outgoing.exits[variant], handoff, moves)
     plan = StagePlan(
         declaration.kind,

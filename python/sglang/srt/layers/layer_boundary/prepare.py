@@ -42,6 +42,7 @@ from sglang.srt.layers.layer_boundary.adapters.context_parallel import (
 from sglang.srt.layers.layer_boundary.layout import (
     SumGroup,
     _cp_shard_token_rows,
+    _sum_group,
     moe_cp_gathered_rows,
 )
 from sglang.srt.layers.layer_boundary.output import (
@@ -103,6 +104,8 @@ def _mlp_input_without_dp(
         )
     elif group is SumGroup.TP:
         hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+    elif group is SumGroup.ATTN_PROJ_TP:
+        hidden_states = _sum_group(group).all_reduce(hidden_states)
     if _is_npu and cache is not None:
         _ = prepare_weight_cache(hidden_states, cache)
     return read.update_and_read(update, hidden_states, residual, layernorm)
@@ -423,6 +426,21 @@ def _mlp_input_gather_attention_cp(
         hidden_states, residual, forward_batch, layernorm, update=update, cache=cache
     )
     return dsa_cp_gather_hidden_states(hidden_states), residual
+
+
+def _mlp_input_gather_ulysses(
+    hidden_states, residual, forward_batch, layernorm, *, gather, **call
+):
+    """Complete and read the local shard, then gather only the FFN input."""
+    from sglang.srt.layers.sp.sp_strategy import get_sp_strategy
+
+    hidden_states, residual = gather(
+        hidden_states, residual, forward_batch, layernorm, **call
+    )
+    return (
+        get_sp_strategy().gather_hidden_states(hidden_states, forward_batch),
+        residual,
+    )
 
 
 def _mlp_input_gather_moe_cp(

@@ -46,6 +46,10 @@ from torch.distributed import Backend, ProcessGroup
 
 from sglang.srt import platforms
 from sglang.srt.compilation.compilation_config import register_split_op
+from sglang.srt.distributed.ulysses_parallel import (
+    UlyssesRankLayout,
+    create_ulysses_groups,
+)
 from sglang.srt.distributed.utils import (
     all_gather_single,
     reduce_scatter_single,
@@ -2189,6 +2193,17 @@ def init_model_parallel_group(
 
 
 _TP: Optional[GroupCoordinator] = None
+# SP attention projection/reduction subgroup; model and cache retain ordinary TP.
+_ULYSSES_ATTN_TP: Optional[GroupCoordinator] = None
+_ULYSSES_SP: Optional[GroupCoordinator] = None
+
+
+def get_ulysses_sp_group() -> GroupCoordinator:
+    if _ULYSSES_SP is None:
+        raise RuntimeError("Ulysses parallel groups are not initialized")
+    return _ULYSSES_SP
+
+
 _ATTN_TP: Optional[GroupCoordinator] = None
 _SHARED_EXPERTS_TP: Optional[GroupCoordinator] = None
 _ATTN_CP: Optional[GroupCoordinator] = None
@@ -2306,7 +2321,15 @@ def graph_capture(stream=None):
     ):
         with contextlib.ExitStack() as stack:
             seen = {id(_TP), id(_PP)}
-            for group in (_DCP, _ATTN_TP, _SHARED_EXPERTS_TP, _MOE_EP, _MOE_TP):
+            for group in (
+                _DCP,
+                _ATTN_TP,
+                _SHARED_EXPERTS_TP,
+                _MOE_EP,
+                _MOE_TP,
+                _ULYSSES_ATTN_TP,
+                _ULYSSES_SP,
+            ):
                 if group is not None and id(group) not in seen:
                     seen.add(id(group))
                     stack.enter_context(group.graph_capture(context))
@@ -2556,6 +2579,7 @@ def initialize_model_parallel(
     recovered_rank: bool = False,
     rank_offset: int = 0,
     max_world_size: Optional[int] = None,
+    ulysses_sequence_parallel_size: int = 1,
 ) -> None:
     """
     Initialize model parallel groups at the published widths.
@@ -2622,6 +2646,10 @@ def initialize_model_parallel(
     decode_context_parallel_size = parallel.attn_dcp_size
     shared_experts_tensor_parallel_size = parallel.shared_experts_tp_size
 
+    # Ulysses compatibility is validated by check_ulysses_sp_args at startup.
+    ulysses_layout = UlyssesRankLayout(
+        tensor_model_parallel_size, ulysses_sequence_parallel_size
+    )
     # Joiners construct their local TP/PP layout in global rank space.
     world_size: int = (
         tensor_model_parallel_size * pipeline_model_parallel_size
@@ -2677,6 +2705,16 @@ def initialize_model_parallel(
         rank_offset=rank_offset,
         max_world_size=max_world_size,
     )
+
+    global _ULYSSES_ATTN_TP, _ULYSSES_SP
+    assert _ULYSSES_ATTN_TP is None, "Ulysses groups are already initialized"
+    if ulysses_sequence_parallel_size > 1:
+        _ULYSSES_ATTN_TP, _ULYSSES_SP = create_ulysses_groups(
+            ulysses_layout,
+            init_model_parallel_group,
+            local_rank=get_world_group().local_rank,
+            backend=backend,
+        )
 
     if duplicate_tp_group:
         global _PDMUX_PREFILL_TP_GROUP
@@ -2968,6 +3006,9 @@ def initialize_model_parallel(
 
     # Validate group widths against the context. Leave disabled groups unset
     # so reading them raises. WORLD was published by distributed initialization.
+    attn_proj_tp_group = (
+        _ULYSSES_ATTN_TP if ulysses_sequence_parallel_size > 1 else _ATTN_TP
+    )
     built = {
         "tp_group": _TP,
         "pp_group": _PP,
@@ -2975,12 +3016,15 @@ def initialize_model_parallel(
         "moe_dp_group": _MOE_DP,
         "moe_tp_group": _MOE_TP,
         "attn_tp_group": _ATTN_TP,
+        "attn_proj_tp_group": attn_proj_tp_group,
         "attn_cp_group": _ATTN_CP,
         "shared_experts_tp_group": _SHARED_EXPERTS_TP,
         "dcp_group": _DCP,
     }
     get_parallel().override_permanently(
-        **{name: group for name, group in built.items() if group is not None}
+        attn_proj_tp_rank=attn_proj_tp_group.rank_in_group,
+        attn_proj_tp_size=attn_proj_tp_group.world_size,
+        **{name: group for name, group in built.items() if group is not None},
     )
 
 
@@ -3129,6 +3173,9 @@ def patch_tensor_parallel_group(tp_group: GroupCoordinator, *, owns_attention: b
             attn_tp_size=tp_group.world_size,
             attn_tp_rank=tp_group.rank_in_group,
             attn_tp_group=tp_group,
+            attn_proj_tp_size=tp_group.world_size,
+            attn_proj_tp_rank=tp_group.rank_in_group,
+            attn_proj_tp_group=tp_group,
             attn_dp_size=1,
             attn_dp_rank=0,
             attn_cp_size=1,
@@ -3257,6 +3304,16 @@ def destroy_model_parallel():
 
     global _SHARED_EXPERTS_TP
     global _ATTN_TP
+    global _ULYSSES_ATTN_TP, _ULYSSES_SP
+
+    if _ULYSSES_SP:
+        _ULYSSES_SP.destroy()
+    _ULYSSES_SP = None
+
+    if _ULYSSES_ATTN_TP:
+        _ULYSSES_ATTN_TP.destroy()
+    _ULYSSES_ATTN_TP = None
+
     global _TP
     if (
         _SHARED_EXPERTS_TP is not None
