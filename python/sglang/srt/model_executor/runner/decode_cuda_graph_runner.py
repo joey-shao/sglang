@@ -721,6 +721,16 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             else cuda_graph_bs <= self.max_bs
         )
 
+        if is_bs_supported and not self.disable_padding:
+            padded_num_tokens = (
+                self._pad_to_bucket(cuda_graph_bs, self.capture_bs)
+                * self.captured_req_width
+            )
+            if get_sp_strategy(forward_batch.input_ids.numel()) is not get_sp_strategy(
+                padded_num_tokens
+            ):
+                return False
+
         if self.require_mlp_sync:
             is_bs_supported = (
                 is_bs_supported and forward_batch.can_run_decode_cuda_graph
@@ -1219,7 +1229,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 ):
                     kwargs["input_embeds"] = self.buffers.input_embeds[:num_tokens]
 
-                if get_sp_strategy() is not None:
+                if get_sp_strategy(forward_batch.input_ids.numel()) is not None:
                     out = sp_model_forward(
                         self.model_runner.model, forward_batch, **kwargs
                     )

@@ -58,6 +58,10 @@ from sglang.srt.layers.moe.utils import (
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding, get_rope
+from sglang.srt.layers.sp.shift_parallel import (
+    ShiftParallelProjections,
+    with_shift_parallel_weights,
+)
 from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
@@ -559,6 +563,13 @@ class Qwen3MoeAttention(nn.Module):
             reduce_results=False,
             prefix=add_prefix("o_proj", prefix),
         )
+        self.shift_tp = (
+            ShiftParallelProjections(
+                self, bias=attention_bias, quant_config=quant_config, prefix=prefix
+            )
+            if get_parallel().enable_shift_parallel
+            else None
+        )
 
         self.rotary_emb = get_rope(
             self.head_dim,
@@ -747,6 +758,10 @@ class Qwen3MoeAttention(nn.Module):
     ):
         if hidden_states.shape[0] == 0:
             return hidden_states, forward_batch, None
+        if self.shift_tp is not None and forward_batch.sp_metadata is None:
+            q, k, v = self.shift_tp.prepare(self, positions, hidden_states)
+            self._used_fused_qk_norm_rope_last_call = False
+            return None, forward_batch, (q, k, v, forward_batch)
         if not _is_npu:
             return self.forward_prepare_native(
                 positions=positions,
@@ -779,7 +794,12 @@ class Qwen3MoeAttention(nn.Module):
             fb,
             save_kv_cache=save_kv_cache,
         )
-        output, _ = self.o_proj(attn_output)
+        o_proj = (
+            self.shift_tp.o_proj
+            if self.shift_tp is not None and forward_batch.sp_metadata is None
+            else self.o_proj
+        )
+        output, _ = o_proj(attn_output)
         return output
 
     def forward(
@@ -1183,7 +1203,7 @@ class Qwen3MoeForCausalLM(nn.Module):
         # Pre-define `params_dict` to avoid repeated expensive traversal of model parameters.
         params_dict = dict(self.named_parameters())
 
-        for name, loaded_weight in weights:
+        for name, loaded_weight in with_shift_parallel_weights(weights):
             if is_mtp:
                 if "mtp" not in name:
                     continue

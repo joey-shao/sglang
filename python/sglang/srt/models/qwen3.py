@@ -20,6 +20,10 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.rotary_embedding.mrope import MRotaryEmbedding
+from sglang.srt.layers.sp.shift_parallel import (
+    ShiftParallelProjections,
+    with_shift_parallel_weights,
+)
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_executor.cuda_graph_config import (
@@ -141,6 +145,13 @@ class Qwen3Attention(nn.Module):
             tp_size=attn_tp_size,
             reduce_results=False,
             prefix=add_prefix("o_proj", prefix),
+        )
+        self.shift_tp = (
+            ShiftParallelProjections(
+                self, bias=attention_bias, quant_config=quant_config, prefix=prefix
+            )
+            if get_parallel().enable_shift_parallel
+            else None
         )
 
         self.rotary_emb = get_rope(
@@ -286,7 +297,10 @@ class Qwen3Attention(nn.Module):
             and get_exec().deterministic.rl_on_policy_target is None
         )
 
-        if use_aiter_fused:
+        use_shift_tp = self.shift_tp is not None and forward_batch.sp_metadata is None
+        if use_shift_tp:
+            q, k, v = self.shift_tp.prepare(self, positions, hidden_states)
+        elif use_aiter_fused:
             q, k, v = self.forward_prepare_aiter_fused_mrope(
                 positions, hidden_states, forward_batch
             )
@@ -308,7 +322,8 @@ class Qwen3Attention(nn.Module):
             k = k.to(torch.bfloat16)
 
         attn_output = self.attn(q, k, v, forward_batch, save_kv_cache=save_kv_cache)
-        output, _ = self.o_proj(attn_output)
+        o_proj = self.shift_tp.o_proj if use_shift_tp else self.o_proj
+        output, _ = o_proj(attn_output)
         return output
 
 
@@ -639,7 +654,7 @@ class Qwen3ForCausalLM(nn.Module):
         ]
 
         params_dict = dict(self.named_parameters())
-        for name, loaded_weight in weights:
+        for name, loaded_weight in with_shift_parallel_weights(weights):
             if not name.startswith("model.") and (
                 name.startswith("layers.")
                 or name.startswith("embed_tokens.")

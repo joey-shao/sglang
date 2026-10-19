@@ -83,9 +83,18 @@ def exchange_attention_output(output, *, metadata: SPBatchMetadata, group):
     )
 
 
-def get_sp_strategy():
-    """Return the fixed Ulysses strategy when sequence parallelism is enabled."""
-    return _STRATEGY if get_parallel().ulysses_sp_size > 1 else None
+def get_sp_strategy(num_tokens: int | None = None):
+    """Resolve SP for a forward, or report availability when no length is given."""
+    parallel = get_parallel()
+    if parallel.ulysses_sp_size == 1:
+        return None
+    if (
+        num_tokens is not None
+        and parallel.enable_shift_parallel
+        and num_tokens < parallel.shift_parallel_threshold
+    ):
+        return None
+    return _STRATEGY
 
 
 def prepare_sp_forward(forward_batch: ForwardBatch, *, attn_num_tokens: int) -> None:

@@ -2,8 +2,8 @@
 
 Ulysses runs on native Qwen3 dense and Qwen3 MoE attention. Attention QKV and O
 projections are constructed with their Ulysses TP layout and loaded through the
-ordinary parameter weight loaders. Each layer has one attention projection
-weight set. FFN/expert weights, embeddings, norms and the LM head keep their
+ordinary parameter weight loaders. Fixed Ulysses uses one attention projection
+weight set per layer. FFN/expert weights, embeddings, norms and the LM head keep their
 ordinary parallel layout.
 
 ```bash
@@ -17,6 +17,27 @@ python -m sglang.launch_server \
 Use a native Qwen3 MoE checkpoint, such as `Qwen/Qwen3-30B-A3B`, for sparse
 FFNs. FlashAttention (`fa3` or `fa4`) is required for both prefill and decode. Setting
 `--ulysses-sp-size` greater than one enables Ulysses for both prefill and decode.
+
+### Switching by forward length
+
+Add `--enable-shift-parallel --shift-parallel-threshold 1024` to select ordinary
+TP below 1024 tokens and Ulysses SP at or above 1024 tokens. The threshold uses
+the total input token count of this forward, not the cached context length or
+the longest request. It applies to both prefill and decode. When
+`--ulysses-sp-size` is left at 1, shift parallel uses `--tp-size` as the SP size;
+an explicit larger SP size retains its SP x TP topology.
+
+Both modes use the same attention instance, per-rank KV head ownership and
+cache locations. Prefix caching and subsequent forwards can therefore switch
+in either direction without migrating KV. Shift parallel additionally loads
+one full-TP shard of QKV/O projection weights per rank through the ordinary
+checkpoint loaders, including FP8 scales. This costs one extra ordinary-TP
+attention projection shard; norms, FFNs and cache storage are shared.
+
+CUDA graph buckets capture the mode selected by their token count. If padding
+would cross the threshold, that forward runs eagerly in its selected mode.
+Other buckets retain prefill breakable and decode full graph execution.
+Without `--enable-shift-parallel`, fixed Ulysses behavior is unchanged.
 
 ## Weights and groups
 

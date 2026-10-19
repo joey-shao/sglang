@@ -1295,6 +1295,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # No exact-shape check: load_batch bucket-pads; only reject
         # disproportionate padding waste.
         padded_num_tokens = self._pad_to_bucket(num_tokens, self.capture_num_tokens)
+        if get_sp_strategy(num_tokens) is not get_sp_strategy(padded_num_tokens):
+            return False
         if padded_num_tokens > num_tokens * _MAX_PREFILL_CUDA_GRAPH_PADDING_FACTOR:
             return False
         return True
@@ -1646,7 +1648,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         else:
             self._init_forward_metadata_for_capture(forward_batch, shape_key)
 
-        if get_sp_strategy() is not None:
+        if get_sp_strategy(num_tokens) is not None:
             # Plan global attention metadata before staging the local body inputs.
             self.prefill_sp_bcg_input.prepare(
                 self, forward_batch, static_num_tokens=num_tokens, capture=True
@@ -1952,7 +1954,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             metadata_forward_batch, static_forward_batch, shape_key
         )
 
-        if get_sp_strategy() is not None:
+        if get_sp_strategy(static_num_tokens) is not None:
             # Eager attention callbacks read this live view during BCG replay;
             # graph segments retain the capture bucket's local token layout.
             self.prefill_sp_bcg_input.prepare(
@@ -2150,7 +2152,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     raw_num_tokens,
                     **kwargs,
                 )
-            elif get_sp_strategy() is not None:
+            elif static_forward_batch.sp_metadata is not None:
                 output = execute_prefill_sp_bcg(
                     self,
                     forward_batch,

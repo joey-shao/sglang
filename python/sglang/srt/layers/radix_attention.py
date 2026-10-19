@@ -178,7 +178,7 @@ class RadixAttention(nn.Module):
         self, q, k, v, forward_batch, save_kv_cache=True, *, output=None, **kwargs
     ):
         """Run attention; with an output buffer, write it and return only LSE."""
-        if self.sp_size == 1:
+        if forward_batch.sp_metadata is None:
             result = get_attn_backend().forward(
                 q, k, v, self, forward_batch, save_kv_cache, **kwargs
             )
@@ -270,14 +270,22 @@ class RadixAttention(nn.Module):
         key_value_num_tokens: Optional[int] = None,
         **kwargs,
     ):
+        sp_size = (
+            self.sp_size
+            if self.sp_size > 1 and forward_batch.sp_metadata is not None
+            else 1
+        )
+        input_q_head_num = self.tp_q_head_num * sp_size
+        input_k_head_num = self.tp_k_head_num * sp_size
+        input_v_head_num = self.tp_v_head_num * sp_size
         if k is not None:
             # For cross-layer sharing, kv can be None
             assert v is not None
             if "k_rope" not in kwargs:
-                k = k.view(-1, self.input_k_head_num, self.qk_head_dim)
-                v = v.view(-1, self.input_v_head_num, self.v_head_dim)
+                k = k.view(-1, input_k_head_num, self.qk_head_dim)
+                v = v.view(-1, input_v_head_num, self.v_head_dim)
             else:
-                k = k.view(-1, self.input_k_head_num, self.v_head_dim)
+                k = k.view(-1, input_k_head_num, self.v_head_dim)
 
         context = get_tc_piecewise_forward_context()
         if (
@@ -299,9 +307,7 @@ class RadixAttention(nn.Module):
                 idx_q = kwargs["idx_q"]
                 idx_k = kwargs["idx_k"]
                 idx_v = kwargs.get("idx_v")
-                attn_out = q.new_empty(
-                    (q.shape[0], self.input_q_head_num * self.v_head_dim)
-                )
+                attn_out = q.new_empty((q.shape[0], input_q_head_num * self.v_head_dim))
                 idx_out = q.new_empty((q.shape[0], idx_q.shape[1] * idx_q.shape[2]))
                 unified_sparse_attention_with_output(
                     q,
@@ -326,7 +332,7 @@ class RadixAttention(nn.Module):
                 out_dtype = torch.bfloat16
             if self.qk_head_dim != self.v_head_dim:
                 output = q.new_empty(
-                    (q.shape[0], self.input_q_head_num * self.v_head_dim),
+                    (q.shape[0], input_q_head_num * self.v_head_dim),
                     dtype=out_dtype,
                 )
             else:
@@ -358,7 +364,7 @@ class RadixAttention(nn.Module):
                     )
                 if kwargs.get("return_lse") or forward_batch.mha_return_lse:
                     assert lse is not None
-                    return output.view(-1, self.input_q_head_num, self.v_head_dim), lse
+                    return output.view(-1, input_q_head_num, self.v_head_dim), lse
                 return output
             # Chunked-prefix MHA needs LSE to merge independently normalized
             # suffix and cached-prefix attention states.
@@ -392,7 +398,7 @@ class RadixAttention(nn.Module):
                 **kwargs,
             )
             if return_lse:
-                return output.view(-1, self.input_q_head_num, self.v_head_dim), lse
+                return output.view(-1, input_q_head_num, self.v_head_dim), lse
             return output
         else:
             return self._forward_backend(
@@ -432,7 +438,7 @@ def _unified_attention_with_output_impl(
     attention_layers = context.attention_layers
     attention_layer = attention_layers[layer_id]
 
-    if attention_layer.sp_size > 1:
+    if attention_layer.sp_size > 1 and forward_batch.sp_metadata is not None:
         kwargs = {
             name: value
             for name, value in (
@@ -743,7 +749,7 @@ def attention_with_output_extra_kwargs(
     context = get_tc_piecewise_forward_context()
     forward_batch = context.forward_batch
     attention_layer = context.attention_layers[layer_id]
-    if attention_layer.sp_size > 1:
+    if attention_layer.sp_size > 1 and forward_batch.sp_metadata is not None:
         return attention_layer._forward_backend(
             query,
             key,

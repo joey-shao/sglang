@@ -59,6 +59,8 @@ def handle_context_parallelism(server_args: Any):
     run_hook(validate_prefill_cp_platform, server_args)
 
     cfg = resolving_view(server_args)
+    if cfg.enable_shift_parallel and cfg.ulysses_sp_size == 1:
+        declare_resolution(server_args, "shift_parallel", ulysses_sp_size=cfg.tp_size)
     if parse_connector_type(cfg.model_path) != ConnectorType.INSTANCE:
         model_config = model_config_of(server_args)
         hf_config = model_config.hf_config

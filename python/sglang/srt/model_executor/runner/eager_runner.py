@@ -263,7 +263,7 @@ class EagerRunner(BaseRunner):
         ctx = device_timer_ctx(model_runner.device_timer, "decode")
 
         with ctx, pdmux_ctx:
-            if get_sp_strategy() is not None:
+            if get_sp_strategy(forward_batch.input_ids.numel()) is not None:
                 return self._execute_sp(forward_batch, kwargs)
             return model_runner.model.forward(
                 forward_batch.input_ids,
@@ -342,7 +342,7 @@ class EagerRunner(BaseRunner):
         )
         with device_timer_ctx(model_runner.device_timer, category):
             pcg_runner = model_runner.prefill_cuda_graph_runner
-            if get_sp_strategy() is not None:
+            if get_sp_strategy(forward_batch.input_ids.numel()) is not None:
                 ret = self._execute_sp(forward_batch, kwargs)
             elif (
                 _is_hip

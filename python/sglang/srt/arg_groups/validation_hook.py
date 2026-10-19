@@ -92,6 +92,11 @@ def check_pipeline_parallel_compat(cfg: Any) -> None:
 def check_ulysses_sp_args(server_args: Any) -> None:
     """Validate Ulysses once at startup, before loading weights or creating groups."""
     cfg = resolving_view(server_args)
+    if cfg.enable_shift_parallel:
+        if cfg.ulysses_sp_size <= 1:
+            raise ValueError("Shift parallel requires --tp-size > 1")
+        if cfg.shift_parallel_threshold < 1:
+            raise ValueError("Shift parallel threshold must be positive")
     if cfg.ulysses_sp_size < 1:
         raise ValueError("Ulysses SP size must be positive")
     if cfg.ulysses_sp_size == 1:

@@ -51,8 +51,19 @@ class Parallel(msgspec.Struct):
     ] = 1
     ulysses_sp_size: A[
         int,
-        "Ulysses sequence parallelism size. Divides --tp-size (the total worker count); attention uses TP subgroups of tp_size / ulysses_sp_size ranks and token shards across SP. FFN, embedding and LM-head weights retain their ordinary parallel layout. Requires FlashAttention (fa3/fa4) attention, eager or breakable CUDA graph prefill, and eager or full CUDA graph decode. Supports ordinary overlap scheduling; two-batch overlap is unsupported. Cannot be combined with attention context parallelism, decode context parallelism, or DP attention.",
+        Arg(
+            help="Ulysses sequence parallelism size. Divides --tp-size (the total worker count); attention uses TP subgroups of tp_size / ulysses_sp_size ranks and token shards across SP. FFN, embedding and LM-head weights retain their ordinary parallel layout. Requires FlashAttention (fa3/fa4) attention, eager or breakable CUDA graph prefill, and eager or full CUDA graph decode. Supports ordinary overlap scheduling; two-batch overlap is unsupported. Cannot be combined with attention context parallelism, decode context parallelism, or DP attention.",
+            resolvable=True,
+        ),
     ] = 1
+    enable_shift_parallel: A[
+        bool,
+        "Switch between TP and Ulysses SP by forward token count. Defaults Ulysses SP size to --tp-size when not configured.",
+    ] = False
+    shift_parallel_threshold: A[
+        int,
+        "Minimum forward token count for Ulysses SP when --enable-shift-parallel is set; shorter forwards use TP.",
+    ] = 1024
     dcp_size: A[
         int,
         Arg(
